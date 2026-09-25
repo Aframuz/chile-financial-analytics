@@ -1,0 +1,32 @@
+defaults:
+  end_date: null
+
+series:
+
+  - name: usd_clp
+    code: F073.TCO.PRE.Z.D
+    start_date: "2020-01-01"
+    frequency: daily
+    unit: clp_per_usd
+    enabled: true
+
+  - name: tpm
+    code: F022.TPM.TIN.D001.NO.Z.D
+    start_date: "2020-01-01"
+    frequency: daily
+    unit: percent
+    enabled: true
+
+  - name: imacec
+    code: F032.IMC.IND.Z.Z.EP18.Z.Z.0.M
+    start_date: "2020-01-01"
+    frequency: monthly
+    unit: index_2018_100
+    enabled: true
+
+  - name: ipc_monthly_variation
+    code: G073.IPC.VAR.2023.M
+    start_date: "2020-01-01"
+    frequency: monthly
+    unit: percent
+    enabled: true
