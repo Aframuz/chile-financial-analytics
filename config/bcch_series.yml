@@ -10,12 +10,24 @@ series:
     unit: clp_per_usd
     enabled: true
 
+    quality:
+      max_null_ratio: 0.35
+      require_numeric: true
+      allow_duplicate_dates: false
+      min_value: 0
+
   - name: tpm
     code: F022.TPM.TIN.D001.NO.Z.D
     start_date: "2020-01-01"
     frequency: daily
     unit: percent
     enabled: true
+
+    quality:
+      max_null_ratio: 0.35
+      require_numeric: true
+      allow_duplicate_dates: false
+      min_value: 0
 
   - name: imacec
     code: F032.IMC.IND.Z.Z.EP18.Z.Z.0.M
@@ -24,9 +36,20 @@ series:
     unit: index_2018_100
     enabled: true
 
+    quality:
+      max_null_ratio: 0.05
+      require_numeric: true
+      allow_duplicate_dates: false
+      min_value: 0
+
   - name: ipc_monthly_variation
     code: G073.IPC.VAR.2023.M
     start_date: "2020-01-01"
     frequency: monthly
     unit: percent
     enabled: true
+
+    quality:
+      max_null_ratio: 0.05
+      require_numeric: true
+      allow_duplicate_dates: false

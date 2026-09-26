@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 
@@ -13,9 +12,20 @@ import yaml
 
 from dotenv import load_dotenv
 
+from src.common.storage import (
+    write_dataframe_json_atomic,
+    write_json_atomic,
+)
+
+from src.validation.bcch import (
+    validate_series_data,
+)
+
+
 # PATHS
 CONFIG_PATH = Path("config/bcch_series.yml")
 RAW_DATA_DIR = Path("data/raw/bcch")
+RUNS_DIR = Path("data/_runs/bcch")
 
 # LOGGING
 logging.basicConfig(
@@ -128,13 +138,6 @@ def extract_series(
         hasta=end_date,
     )
 
-    # Check if the DataFrame is empty and raise an error if so
-    if df.empty:
-        raise RuntimeError(
-            f"No data returned for {series_name} "
-            f"({series_code})."
-        )
-
     return df
 
 def build_output_dir(
@@ -151,24 +154,20 @@ def build_output_dir(
 def save_raw(
     df: pd.DataFrame,
     output_dir: Path,
-) -> Path:
-    """Save the raw data to a JSON file in the specified output directory.
-    If the directory already exists, that's okay."""
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+) -> tuple[Path, str]:
+    """Save the raw DataFrame to a JSON file in the specified output directory."""
+    output_path = (
+        output_dir / "data.json"
     )
 
-    output_path = output_dir / "data.json"
-
-    df.to_json(
-        output_path,
-        orient="table",
-        date_format="iso",
-        indent=2,
+    checksum = (
+        write_dataframe_json_atomic(
+            df=df,
+            path=output_path,
+        )
     )
 
-    return output_path
+    return output_path, checksum
 
 def save_metadata(
     df: pd.DataFrame,
@@ -177,35 +176,74 @@ def save_metadata(
     end_date: str,
     extracted_at: datetime,
     output_dir: Path,
+    checksum: str,
+    validation: dict[str, Any],
 ) -> Path:
     """Save metadata about the extracted data to a JSON file in the specified output directory."""
-    
-    # Build the metadata dictionary
     metadata = {
-        "source": "Banco Central de Chile - BDE",
-        "series_code": series_config["code"],
-        "series_name": series_config["name"],
-        "frequency": series_config.get("frequency"),
-        "unit": series_config.get("unit"),
-        "requested_start_date": start_date,
-        "requested_end_date": end_date,
-        "first_observation": str(df.index.min()),
-        "last_observation": str(df.index.max()),
-        "row_count": len(df),
-        "extracted_at_utc": extracted_at.isoformat(),
-        "extractor": "bcchapi",
-        "bcchapi_version": version("bcchapi"),
+        "source":
+            "Banco Central de Chile - BDE",
+
+        "series_code":
+            series_config["code"],
+
+        "series_name":
+            series_config["name"],
+
+        "frequency":
+            series_config.get(
+                "frequency"
+            ),
+
+        "unit":
+            series_config.get(
+                "unit"
+            ),
+
+        "requested_start_date":
+            start_date,
+
+        "requested_end_date":
+            end_date,
+
+        "first_observation": (
+            str(df.index.min())
+            if not df.empty
+            else None
+        ),
+
+        "last_observation": (
+            str(df.index.max())
+            if not df.empty
+            else None
+        ),
+
+        "row_count":
+            len(df),
+
+        "extracted_at_utc":
+            extracted_at.isoformat(),
+
+        "extractor":
+            "bcchapi",
+
+        "bcchapi_version":
+            version("bcchapi"),
+
+        "data_file_sha256":
+            checksum,
+
+        "quality": validation,
     }
 
-    metadata_path = output_dir / "metadata.json"
+    metadata_path = (
+        output_dir
+        / "metadata.json"
+    )
 
-    metadata_path.write_text(
-        json.dumps(
-            metadata,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    write_json_atomic(
+        data=metadata,
+        path=metadata_path,
     )
 
     return metadata_path
@@ -215,19 +253,25 @@ def ingest_series(
     series_config: dict[str, Any],
     end_date: str,
     run_started_at: datetime,
-) -> None:
-    """Ingest a single series from the BCCH API based on the provided configuration."""
-    series_name = series_config["name"]
-    series_code = series_config["code"]
-    start_date = series_config["start_date"]
+) -> dict[str, Any]:
+    """Ingest a single series based on the provided configuration."""
+    series_name = (
+        series_config["name"]
+    )
 
-    # Log the start of the ingestion process
+    series_code = (
+        series_config["code"]
+    )
+
+    start_date = (
+        series_config["start_date"]
+    )
+
     logger.info(
         "Starting ingestion for %s",
         series_name,
     )
 
-    # Extract the series data from the BCCH API
     df = extract_series(
         client=client,
         series_code=series_code,
@@ -236,43 +280,169 @@ def ingest_series(
         end_date=end_date,
     )
 
-    extraction_date = (
-        run_started_at.date().isoformat()
+    validation = validate_series_data(
+        df=df,
+        series_config=series_config,
+        start_date=start_date,
+        end_date=end_date,
     )
 
-    # Build the output directory path for the extracted data
+    extraction_date = (
+        run_started_at
+        .date()
+        .isoformat()
+    )
+
     output_dir = build_output_dir(
         series_name=series_name,
         extraction_date=extraction_date,
     )
 
-    data_path = save_raw(
+    data_path, checksum = save_raw(
         df=df,
         output_dir=output_dir,
     )
 
-    # Save metadata about the extracted data
-    save_metadata(
+    metadata_path = save_metadata(
         df=df,
         series_config=series_config,
         start_date=start_date,
         end_date=end_date,
         extracted_at=run_started_at,
         output_dir=output_dir,
+        checksum=checksum,
+        validation=validation,
     )
 
-    # Log the completion of the ingestion process
-    logger.info(
-        "Completed %s: %s rows written to %s",
-        series_name,
-        len(df),
-        data_path,
+    status = (
+        "success"
+        if validation["passed"]
+        else "quality_failed"
     )
+
+    if validation["passed"]:
+
+        logger.info(
+            "Completed %s: "
+            "%s rows written to %s",
+            series_name,
+            len(df),
+            data_path,
+        )
+
+    else:
+
+        logger.error(
+            "Data-quality validation "
+            "failed for %s",
+            series_name,
+        )
+
+    return {
+        "series_name": series_name,
+        "series_code": series_code,
+        "status": status,
+        "row_count": len(df),
+        "data_path": str(data_path),
+        "metadata_path":
+            str(metadata_path),
+        "checksum_sha256": checksum,
+        "quality_passed":
+            validation["passed"],
+    }
+    
+def save_run_summary(
+    results: list[dict[str, Any]],
+    started_at: datetime,
+    ended_at: datetime,
+    end_date: str,
+) -> Path:
+
+    run_id = started_at.strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+
+    success_count = sum(
+        result["status"] == "success"
+        for result in results
+    )
+
+    quality_failed_count = sum(
+        result["status"]
+        == "quality_failed"
+        for result in results
+    )
+
+    technical_failed_count = sum(
+        result["status"]
+        == "technical_failed"
+        for result in results
+    )
+
+    overall_status = (
+        "success"
+        if (
+            quality_failed_count == 0
+            and technical_failed_count == 0
+        )
+        else "failed"
+    )
+
+    summary = {
+        "run_id": run_id,
+        "pipeline": "bcch_ingestion",
+
+        "status":
+            overall_status,
+
+        "started_at_utc":
+            started_at.isoformat(),
+
+        "ended_at_utc":
+            ended_at.isoformat(),
+
+        "requested_end_date":
+            end_date,
+
+        "total_series":
+            len(results),
+
+        "success_count":
+            success_count,
+
+        "quality_failed_count":
+            quality_failed_count,
+
+        "technical_failed_count":
+            technical_failed_count,
+
+        "results":
+            results,
+    }
+
+    run_date = (
+        started_at.date().isoformat()
+    )
+
+    output_path = (
+        RUNS_DIR
+        / f"run_date={run_date}"
+        / f"{run_id}.json"
+    )
+
+    write_json_atomic(
+        data=summary,
+        path=output_path,
+    )
+
+    return output_path
     
 # =======================
 # MAIN
 # =======================
-def main() -> None:
+def main() -> int:
+    results: list[dict[str, Any]] = []
+    
     config = load_config(CONFIG_PATH)
 
     validate_config(config)
@@ -299,18 +469,74 @@ def main() -> None:
             "enabled",
             True,
         ):
+
             logger.info(
                 "Skipping disabled series: %s",
                 series_config["name"],
             )
+
             continue
 
-        ingest_series(
-            client=client,
-            series_config=series_config,
-            end_date=end_date,
-            run_started_at=run_started_at,
-        )
+        try:
+
+            result = ingest_series(
+                client=client,
+                series_config=series_config,
+                end_date=end_date,
+                run_started_at=run_started_at,
+            )
+
+            results.append(result)
+
+        except Exception as exc:
+
+            logger.exception(
+                "Technical failure while "
+                "ingesting %s",
+                series_config["name"],
+            )
+
+            results.append(
+                {
+                    "series_name":
+                        series_config["name"],
+
+                    "series_code":
+                        series_config["code"],
+
+                    "status":
+                        "technical_failed",
+
+                    "error":
+                        str(exc),
+                }
+            )
+
+    ended_at = datetime.now(
+    timezone.utc
+    )
+
+    summary_path = save_run_summary(
+        results=results,
+        started_at=run_started_at,
+        ended_at=ended_at,
+        end_date=end_date,
+    )
+
+    has_failures = any(
+        result["status"] != "success"
+        for result in results
+    )
+
+    logger.info(
+        "Run summary written to %s",
+        summary_path,
+    )
+
+    if has_failures:
+        return 1
+
+    return 0
         
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
