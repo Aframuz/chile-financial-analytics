@@ -21,6 +21,10 @@ from src.validation.bcch import (
     validate_series_data,
 )
 
+from src.common.publisher import (
+    publish_artifacts,
+)
+
 
 # PATHS
 CONFIG_PATH = Path("config/bcch_series.yml")
@@ -313,6 +317,13 @@ def ingest_series(
         checksum=checksum,
         validation=validation,
     )
+    
+    published = publish_artifacts(
+        data_path=data_path,
+        metadata_path=metadata_path,
+        series_name=series_name,
+        extraction_date=extraction_date,
+    )
 
     status = (
         "success"
@@ -343,12 +354,12 @@ def ingest_series(
         "series_code": series_code,
         "status": status,
         "row_count": len(df),
-        "data_path": str(data_path),
-        "metadata_path":
-            str(metadata_path),
+        "local_data_path": str(data_path),
+        "local_metadata_path": str(metadata_path),
+        "data_uri": published["data_uri"],
+        "metadata_uri": published["metadata_uri"],
         "checksum_sha256": checksum,
-        "quality_passed":
-            validation["passed"],
+        "quality_passed":validation["passed"],
     }
     
 def save_run_summary(
