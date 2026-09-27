@@ -25,6 +25,10 @@ from src.common.publisher import (
     publish_artifacts,
 )
 
+from src.common.warehouse import (
+    publish_to_bigquery,
+)
+
 
 # PATHS
 CONFIG_PATH = Path("config/bcch_series.yml")
@@ -324,12 +328,15 @@ def ingest_series(
         series_name=series_name,
         extraction_date=extraction_date,
     )
+    
 
     status = (
         "success"
         if validation["passed"]
         else "quality_failed"
     )
+
+    warehouse_rows = 0
 
     if validation["passed"]:
 
@@ -339,6 +346,12 @@ def ingest_series(
             series_name,
             len(df),
             data_path,
+        )
+        
+        warehouse_rows = publish_to_bigquery(
+            df=df,
+            series_config=series_config,
+            extracted_at=run_started_at,
         )
 
     else:
@@ -360,6 +373,7 @@ def ingest_series(
         "metadata_uri": published["metadata_uri"],
         "checksum_sha256": checksum,
         "quality_passed":validation["passed"],
+        "warehouse_rows": warehouse_rows,
     }
     
 def save_run_summary(

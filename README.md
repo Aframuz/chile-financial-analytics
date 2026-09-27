@@ -27,3 +27,21 @@ The ingestion pipeline supports:
 - `gcs`
 
 configured using the `STORAGE_BACKEND` environment variable.
+
+### BigQuery raw model
+
+`raw_bcch.observations`
+
+**Grain:** one observation for one Banco Central series
+on one observation date.
+
+Natural key:
+
+- `series_code`
+- `observation_date`
+
+The table is partitioned by `observation_date` and
+clustered by `series_code`.
+
+Loads use a staging table followed by a BigQuery `MERGE`
+to support idempotent reruns and upstream revisions.
