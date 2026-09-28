@@ -1,0 +1,82 @@
+[0m11:23:46.073834 [debug] [MainThread]: Sending event: {'category': 'dbt', 'action': 'invocation', 'label': 'start', 'context': [<snowplow_tracker.self_describing_json.SelfDescribingJson object at 0x7b963fe4e510>, <snowplow_tracker.self_describing_json.SelfDescribingJson object at 0x7b963ead3d90>, <snowplow_tracker.self_describing_json.SelfDescribingJson object at 0x7b963ead3890>]}
+
+
+============================== 11:23:46.076316 | 168abd93-93be-4ded-a3cc-7b2388a25557 ==============================
+[0m11:23:46.076316 [info ] [MainThread]: Running with dbt=1.12.5
+[0m11:23:46.076731 [debug] [MainThread]: running dbt with arguments {'use_colors': 'True', 'quiet': 'False', 'log_cache_events': 'False', 'warn_error_options': 'WarnErrorOptionsV2(error=[], warn=[], silence=[])', 'debug': 'False', 'no_print': 'None', 'use_experimental_parser': 'False', 'profiles_dir': '/home/aframuz/.dbt', 'empty': 'None', 'fail_fast': 'False', 'maximum_seed_size_mib': '1', 'hints_enabled': 'True', 'target_path': 'None', 'indirect_selection': 'eager', 'invocation_command': 'dbt init chile_financial_analytics', 'send_anonymous_usage_stats': 'True', 'printer_width': '80', 'warn_error': 'None', 'log_path': 'logs', 'cache_selected_only': 'False', 'partial_parse': 'True', 'version_check': 'True', 'static_parser': 'True', 'introspect': 'True', 'write_json': 'True', 'log_format': 'default'}
+[0m11:23:46.083872 [info ] [MainThread]: Creating dbt configuration folder at /home/aframuz/.dbt
+[0m11:23:46.085174 [debug] [MainThread]: Starter project path: /home/aframuz/code/de-portfolio/chile-financial-analytics-platform/.venv/lib/python3.13/site-packages/dbt/include/starter_project
+[0m11:23:46.087783 [info ] [MainThread]: Setting up your profile.
+[0m11:24:56.801710 [info ] [MainThread]: Profile chile_financial_analytics written to /home/aframuz/.dbt/profiles.yml using target's profile_template.yml and your supplied values.
+[0m11:24:56.803819 [info ] [MainThread]: Running dbt debug to validate the project...
+[0m11:24:56.804497 [info ] [MainThread]: dbt version: 1.12.5
+[0m11:24:56.804845 [info ] [MainThread]: python version: 3.13.5
+[0m11:24:56.805103 [info ] [MainThread]: python path: /home/aframuz/code/de-portfolio/chile-financial-analytics-platform/.venv/bin/python
+[0m11:24:56.805376 [info ] [MainThread]: os info: Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39
+[0m11:24:56.853984 [info ] [MainThread]: Using profiles dir at /home/aframuz/.dbt
+[0m11:24:56.855009 [info ] [MainThread]: Using profiles.yml file at /home/aframuz/.dbt/profiles.yml
+[0m11:24:56.855272 [info ] [MainThread]: Using dbt_project.yml file at /home/aframuz/code/de-portfolio/chile-financial-analytics-platform/dbt/chile_financial_analytics/dbt_project.yml
+[0m11:24:56.855533 [info ] [MainThread]: adapter type: bigquery
+[0m11:24:56.855781 [info ] [MainThread]: adapter version: 1.12.1
+[0m11:24:56.933427 [info ] [MainThread]: Configuration:
+[0m11:24:56.933969 [info ] [MainThread]:   profiles.yml file [[32mOK found and valid[0m]
+[0m11:24:56.934400 [info ] [MainThread]:   dbt_project.yml file [[32mOK found and valid[0m]
+[0m11:24:56.934828 [info ] [MainThread]: Required dependencies:
+[0m11:24:56.935264 [debug] [MainThread]: Executing "git --help"
+[0m11:24:56.937557 [debug] [MainThread]: STDOUT: "b"usage: git [-v | --version] [-h | --help] [-C <path>] [-c <name>=<value>]\n           [--exec-path[=<path>]] [--html-path] [--man-path] [--info-path]\n           [-p | --paginate | -P | --no-pager] [--no-replace-objects] [--bare]\n           [--git-dir=<path>] [--work-tree=<path>] [--namespace=<name>]\n           [--config-env=<name>=<envvar>] <command> [<args>]\n\nThese are common Git commands used in various situations:\n\nstart a working area (see also: git help tutorial)\n   clone     Clone a repository into a new directory\n   init      Create an empty Git repository or reinitialize an existing one\n\nwork on the current change (see also: git help everyday)\n   add       Add file contents to the index\n   mv        Move or rename a file, a directory, or a symlink\n   restore   Restore working tree files\n   rm        Remove files from the working tree and from the index\n\nexamine the history and state (see also: git help revisions)\n   bisect    Use binary search to find the commit that introduced a bug\n   diff      Show changes between commits, commit and working tree, etc\n   grep      Print lines matching a pattern\n   log       Show commit logs\n   show      Show various types of objects\n   status    Show the working tree status\n\ngrow, mark and tweak your common history\n   branch    List, create, or delete branches\n   commit    Record changes to the repository\n   merge     Join two or more development histories together\n   rebase    Reapply commits on top of another base tip\n   reset     Reset current HEAD to the specified state\n   switch    Switch branches\n   tag       Create, list, delete or verify a tag object signed with GPG\n\ncollaborate (see also: git help workflows)\n   fetch     Download objects and refs from another repository\n   pull      Fetch from and integrate with another repository or a local branch\n   push      Update remote refs along with associated objects\n\n'git help -a' and 'git help -g' list available subcommands and some\nconcept guides. See 'git help <command>' or 'git help <concept>'\nto read about a specific subcommand or concept.\nSee 'git help git' for an overview of the system.\n""
+[0m11:24:56.938320 [debug] [MainThread]: STDERR: "b''"
+[0m11:24:56.938545 [info ] [MainThread]:  - git [[32mOK found[0m]
+
+[0m11:24:56.938983 [info ] [MainThread]: Connection:
+[0m11:24:56.939330 [info ] [MainThread]:   method: oauth
+[0m11:24:56.939795 [info ] [MainThread]:   database: chile-financial-analytics
+[0m11:24:56.940172 [info ] [MainThread]:   execution_project: chile-financial-analytics
+[0m11:24:56.940514 [info ] [MainThread]:   schema: chile-financial-analytics-raw
+[0m11:24:56.940885 [info ] [MainThread]:   location: US
+[0m11:24:56.941376 [info ] [MainThread]:   priority: interactive
+[0m11:24:56.941676 [info ] [MainThread]:   maximum_bytes_billed: None
+[0m11:24:56.941953 [info ] [MainThread]:   reservation: None
+[0m11:24:56.942241 [info ] [MainThread]:   impersonate_service_account: None
+[0m11:24:56.942507 [info ] [MainThread]:   job_retry_deadline_seconds: None
+[0m11:24:56.942768 [info ] [MainThread]:   job_retries: 1
+[0m11:24:56.943026 [info ] [MainThread]:   job_creation_timeout_seconds: None
+[0m11:24:56.943271 [info ] [MainThread]:   job_execution_timeout_seconds: 300
+[0m11:24:56.943502 [info ] [MainThread]:   job_link_info_level_log: False
+[0m11:24:56.943723 [info ] [MainThread]:   timeout_seconds: 300
+[0m11:24:56.943945 [info ] [MainThread]:   client_id: None
+[0m11:24:56.944163 [info ] [MainThread]:   token_uri: None
+[0m11:24:56.944384 [info ] [MainThread]:   compute_region: None
+[0m11:24:56.944604 [info ] [MainThread]:   dataproc_cluster_name: None
+[0m11:24:56.944825 [info ] [MainThread]:   gcs_bucket: None
+[0m11:24:56.945101 [info ] [MainThread]:   dataproc_batch: None
+[0m11:24:56.945545 [info ] [MainThread]: Registered adapter: bigquery=1.12.1
+[0m11:24:57.015675 [debug] [MainThread]: Acquiring new bigquery connection 'debug'
+[0m11:24:57.016225 [debug] [MainThread]: On debug: select 1 as id
+[0m11:24:57.016653 [debug] [MainThread]: Opening a new connection, currently in state init
+[0m11:25:00.223796 [debug] [MainThread]: BigQuery adapter: https://console.cloud.google.com/bigquery?project=chile-financial-analytics&j=bq:US:660d1139-08d7-473d-9708-5b9aa7fa33ca&page=queryresults
+[0m11:25:00.659439 [debug] [MainThread]: SQL status: OK in 0.435 seconds
+[0m11:25:01.135898 [info ] [MainThread]:   Connection test: [[32mOK connection ok[0m]
+
+[0m11:25:01.136415 [info ] [MainThread]: [32mAll checks passed![0m
+[0m11:25:01.136760 [info ] [MainThread]: Your new dbt project "chile_financial_analytics" was created!
+Initialized new project in /home/aframuz/code/de-portfolio/chile-financial-analytics-platform/dbt/chile_financial_analytics/chile_financial_analytics
+
+For more information on how to configure the profiles.yml file,
+please consult the dbt documentation here:
+
+  https://docs.getdbt.com/docs/configure-your-profile
+
+One more thing:
+
+Need help? Don't hesitate to reach out to us via GitHub issues or on Slack:
+
+  https://community.getdbt.com/
+
+Happy modeling!
+
+[0m11:25:01.137497 [debug] [MainThread]: Resource report: {"command_name": "init", "command_success": true, "command_wall_clock_time": 75.11706, "process_in_blocks": "640", "process_kernel_time": 0.337883, "process_mem_max_rss": "236172", "process_out_blocks": "96", "process_user_time": 3.455225}
+[0m11:25:01.138608 [debug] [MainThread]: Command `dbt init` succeeded at 11:25:01.138459 after 75.12 seconds
+[0m11:25:01.139083 [debug] [MainThread]: Connection 'debug' was properly closed.
+[0m11:25:01.139565 [debug] [MainThread]: Sending event: {'category': 'dbt', 'action': 'invocation', 'label': 'end', 'context': [<snowplow_tracker.self_describing_json.SelfDescribingJson object at 0x7b95f65b6c40>, <snowplow_tracker.self_describing_json.SelfDescribingJson object at 0x7b963eb77e30>, <snowplow_tracker.self_describing_json.SelfDescribingJson object at 0x7b95f646acf0>]}
+[0m11:25:01.140147 [debug] [MainThread]: Flushing usage events
+[0m11:25:01.747610 [debug] [MainThread]: An error was encountered while trying to flush usage events

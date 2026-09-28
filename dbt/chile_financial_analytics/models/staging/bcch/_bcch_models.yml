@@ -1,0 +1,23 @@
+version: 2
+
+models:
+
+  - name: stg_bcch__observations
+    description: >
+      Clean staging representation of economic observations
+      ingested from Banco Central de Chile.
+
+    columns:
+
+      - name: series_code
+        tests:
+          - not_null
+
+      - name: observation_date
+        tests:
+          - not_null
+
+      - name: value
+        description: >
+          Null on non-business days (weekends/holidays) for daily series,
+          as returned by the BCCh API. Filtered out in fact_economic_observation.

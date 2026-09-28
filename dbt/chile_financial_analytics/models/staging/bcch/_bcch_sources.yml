@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+
+  - name: bcch
+    database: chile-financial-analytics 
+    schema: raw_bcch
+
+    tables:
+
+      - name: observations
