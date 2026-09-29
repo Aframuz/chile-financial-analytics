@@ -300,3 +300,121 @@ def validate_series_data(
         "checks": checks,
         "metrics": metrics,
     }
+
+CURATED_REQUIRED_FIELDS = (
+    "series_name",
+    "category",
+    "unit",
+)
+
+
+def validate_series_metadata(
+    series_config: dict[str, Any],
+    catalog_matches: pd.DataFrame,
+    curated: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate the metadata of one series.
+
+    catalog_matches: rows of the BCCh SearchSeries catalog
+    whose seriesId equals the configured code.
+
+    curated: the entry of metadata/bcch/series.yml for the
+    configured code, or None if missing.
+    """
+
+    checks: list[dict[str, Any]] = []
+
+    def add_check(
+        name: str,
+        passed: bool,
+        message: str,
+    ) -> None:
+
+        checks.append(
+            {
+                "name": name,
+                "passed": passed,
+                "message": message,
+            }
+        )
+
+    match_count = len(catalog_matches)
+
+    # ----------------------------
+    # 1. Source catalog
+    # ----------------------------
+
+    add_check(
+        name="found_in_catalog",
+        passed=match_count > 0,
+        message=f"match_count={match_count}",
+    )
+
+    # Grain: one row per series_code
+    add_check(
+        name="unique_in_catalog",
+        passed=match_count <= 1,
+        message=f"match_count={match_count}",
+    )
+
+    if match_count == 1:
+
+        source_frequency = str(
+            catalog_matches["frequencyCode"].iloc[0]
+        ).lower()
+
+        configured_frequency = series_config.get(
+            "frequency"
+        )
+
+        add_check(
+            name="frequency_matches_config",
+            passed=(
+                configured_frequency is None
+                or configured_frequency.lower()
+                == source_frequency
+            ),
+            message=(
+                f"source={source_frequency}, "
+                f"configured={configured_frequency}"
+            ),
+        )
+
+    # ----------------------------
+    # 2. Curated metadata
+    # ----------------------------
+
+    add_check(
+        name="curated_metadata_present",
+        passed=curated is not None,
+        message=f"series_code={series_config['code']}",
+    )
+
+    missing_fields = [
+        field
+        for field in CURATED_REQUIRED_FIELDS
+        if not (curated or {}).get(field)
+    ]
+
+    add_check(
+        name="curated_required_fields",
+        passed=not missing_fields,
+        message=f"missing_fields={missing_fields}",
+    )
+
+    # ----------------------------
+    # Final result
+    # ----------------------------
+
+    passed = all(
+        check["passed"]
+        for check in checks
+    )
+
+    return {
+        "passed": passed,
+        "checks": checks,
+        "metrics": {
+            "catalog_match_count": match_count,
+        },
+    }

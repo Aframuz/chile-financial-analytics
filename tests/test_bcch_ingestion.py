@@ -1,6 +1,6 @@
 import pandas as pd
 
-from src.ingestion.bcch import (
+from src.ingestion.observations import (
     extract_series,
 )
 

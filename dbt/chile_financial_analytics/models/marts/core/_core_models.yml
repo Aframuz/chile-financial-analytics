@@ -19,10 +19,114 @@ models:
           - unique
           - not_null
 
+      - name: series_name
+        tests:
+          - not_null
+
+      - name: category
+      - name: frequency
+      - name: unit
+
+
+  - name: dim_date
+    description: >
+      Calendar dimension.
+
+      Grain: one row per calendar day. The range is contiguous (no gaps)
+      and derived from the data: from the earliest to the latest
+      observation_date across all BCCh series in stg_bcch__observations.
+
+      date_key is the surrogate primary key (YYYYMMDD integer) that facts
+      reference; date_day is the natural key.
+
+    columns:
+
+      - name: date_key
+        description: Surrogate primary key, YYYYMMDD integer (e.g. 20260925).
+        tests:
+          - unique
+          - not_null
+
+      - name: date_day
+        description: Calendar day. Natural key.
+        tests:
+          - unique
+          - not_null
+          # Contiguous: every day follows the previous one by exactly 1 day
+          - dbt_utils.sequential_values:
+              arguments:
+                interval: 1
+                datepart: day
+
+      - name: year
+        tests:
+          - not_null
+
+      - name: quarter
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [1, 2, 3, 4]
+                quote: false
+
+      - name: month
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+                quote: false
+
+      - name: day
+        description: Day of month.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 31
+
+      - name: day_of_week
+        description: BigQuery convention (Sunday = 1, Saturday = 7).
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [1, 2, 3, 4, 5, 6, 7]
+                quote: false
+
+      - name: month_name
+        tests:
+          - not_null
+
+      - name: day_name
+        tests:
+          - not_null
+
+      - name: is_weekend
+        description: True on Saturday and Sunday.
+        tests:
+          - not_null
+
+    data_tests:
+
+      # is_weekend must agree with day_of_week
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "is_weekend = (day_of_week in (1, 7))"
+
+      # date_key must encode date_day
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "date_key = cast(format_date('%Y%m%d', date_day) as int64)"
+
 
   - name: fact_economic_observation
     description: >
-      Economic observations by series and observation date.
+      Economic observations.
+
+      Grain: one observed value for one series on one date.
 
     columns:
 
@@ -34,7 +138,16 @@ models:
                 to: ref('dim_series')
                 field: series_key
 
+      - name: date_key
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+
       - name: observation_date
+        description: Kept on the fact for convenience and partition-friendly filtering.
         tests:
           - not_null
 
@@ -45,6 +158,7 @@ models:
     data_tests:
 
       - dbt_utils.unique_combination_of_columns:
-          combination_of_columns:
-            - series_key
-            - observation_date
+          arguments:
+            combination_of_columns:
+              - series_key
+              - date_key

@@ -1,0 +1,39 @@
+# Curated BCCh series metadata.
+#
+# This is domain data, not pipeline configuration:
+#
+#   config/bcch_series.yml    → what the pipeline downloads
+#   metadata/bcch/series.yml  → what we know about each series
+#
+# The BCCh SearchSeries catalog provides frequency, coverage dates and
+# source titles, but its titles are not analyst-friendly (inconsistent
+# "\", "|" and ";" delimiters). The fields below fill that gap and are
+# merged with the catalog by src/ingestion/series.py into raw_bcch.series.
+#
+# Keyed by BCCh series code. Required: series_name, category, unit.
+
+series:
+
+  - code: F073.TCO.PRE.Z.D
+    series_name: USD/CLP
+    description: Tipo de cambio nominal (dólar observado)
+    category: Exchange Rate
+    unit: CLP per USD
+
+  - code: F022.TPM.TIN.D001.NO.Z.D
+    series_name: TPM
+    description: Tasa de política monetaria
+    category: Monetary Policy
+    unit: Percent
+
+  - code: F032.IMC.IND.Z.Z.EP18.Z.Z.0.M
+    series_name: IMACEC
+    description: Indicador mensual de actividad económica, serie original empalmada
+    category: Economic Activity
+    unit: Index (2018=100)
+
+  - code: G073.IPC.VAR.2023.M
+    series_name: IPC Monthly Variation
+    description: Variación mensual del índice de precios al consumidor, empalme BCCh
+    category: Inflation
+    unit: Percent

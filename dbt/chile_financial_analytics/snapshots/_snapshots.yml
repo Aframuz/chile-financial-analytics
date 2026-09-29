@@ -1,0 +1,28 @@
+version: 2
+
+snapshots:
+
+  - name: bcch_series_snapshot
+    description: >
+      SCD Type 2 history of BCCh series metadata (name, frequency,
+      unit, category). One row per series per version; the current
+      version has dbt_valid_to = null.
+
+    columns:
+
+      - name: dbt_scd_id
+        tests:
+          - unique
+          - not_null
+
+      - name: series_code
+        tests:
+          - not_null
+          # At most one current version per series
+          - unique:
+              config:
+                where: "dbt_valid_to is null"
+
+      - name: dbt_valid_from
+        tests:
+          - not_null

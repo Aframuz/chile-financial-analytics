@@ -2,6 +2,74 @@ version: 2
 
 models:
 
+  - name: stg_bcch__series
+    description: >
+      One row per BCCh series: latest known metadata, combining the
+      BCCh catalog with curated names, categories and units.
+
+    columns:
+
+      - name: series_code
+        description: BCCh series code. Grain of the model.
+        tests:
+          - unique
+          - not_null
+
+      - name: series_name
+        description: >
+          Curated display name. Unique so analysts can't confuse
+          two series in reports.
+        tests:
+          - unique
+          - not_null
+
+      - name: category
+        description: >
+          Curated category. Controlled vocabulary: extend the list
+          when adding a new category to metadata/bcch/series.yml.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - Exchange Rate
+                  - Monetary Policy
+                  - Economic Activity
+                  - Inflation
+
+      - name: frequency
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['daily', 'monthly', 'quarterly', 'annual']
+
+      - name: unit
+        tests:
+          - not_null
+
+      - name: source
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['bcch']
+
+      - name: first_observation_date
+        tests:
+          - not_null
+
+      - name: last_observation_date
+        tests:
+          - not_null
+
+    data_tests:
+
+      # BCCh coverage dates must be consistent
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "first_observation_date <= last_observation_date"
+
   - name: stg_bcch__observations
     description: >
       Clean staging representation of economic observations
@@ -12,6 +80,12 @@ models:
       - name: series_code
         tests:
           - not_null
+          # Every observed series needs metadata: run
+          # src/ingestion/series.py after adding a series to config
+          - relationships:
+              arguments:
+                to: ref('stg_bcch__series')
+                field: series_code
 
       - name: observation_date
         tests:
@@ -21,3 +95,12 @@ models:
         description: >
           Null on non-business days (weekends/holidays) for daily series,
           as returned by the BCCh API. Filtered out in fact_economic_observation.
+
+    data_tests:
+
+      # Grain: one observation per series per date
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - series_code
+              - observation_date

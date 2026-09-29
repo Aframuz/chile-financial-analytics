@@ -6,20 +6,19 @@ from google.cloud import bigquery
 
 from src.common.bigquery import (
     ensure_observations_table,
+    ensure_series_table,
     load_observations_via_staging,
+    load_series_via_staging,
 )
 
 from src.transforms.bcch import (
     prepare_bcch_observations,
 )
 
-def publish_to_bigquery(
-    df: pd.DataFrame,
-    series_config: dict,
-    extracted_at: datetime,
-) -> int:
 
-    enabled = (
+def bigquery_enabled() -> bool:
+
+    return (
         os.getenv(
             "BIGQUERY_ENABLED",
             "false",
@@ -27,8 +26,9 @@ def publish_to_bigquery(
         == "true"
     )
 
-    if not enabled:
-        return 0
+
+def bigquery_target() -> tuple[bigquery.Client, str, str]:
+    """Return (client, project_id, dataset_id) from the environment."""
 
     project_id = os.getenv(
         "GCP_PROJECT_ID"
@@ -49,6 +49,22 @@ def publish_to_bigquery(
         project=project_id
     )
 
+    return client, project_id, dataset_id
+
+
+def publish_to_bigquery(
+    df: pd.DataFrame,
+    series_config: dict,
+    extracted_at: datetime,
+) -> int:
+
+    if not bigquery_enabled():
+        return 0
+
+    client, project_id, dataset_id = (
+        bigquery_target()
+    )
+
     ensure_observations_table(
         client=client,
         project_id=project_id,
@@ -64,6 +80,35 @@ def publish_to_bigquery(
     )
 
     return load_observations_via_staging(
+        client=client,
+        dataframe=warehouse_df,
+        project_id=project_id,
+        dataset_id=dataset_id,
+    )
+
+
+def publish_series_to_bigquery(
+    warehouse_df: pd.DataFrame,
+) -> int:
+    """Load canonical raw_bcch.series rows (see prepare_bcch_series)."""
+
+    if not bigquery_enabled():
+        return 0
+
+    if warehouse_df.empty:
+        return 0
+
+    client, project_id, dataset_id = (
+        bigquery_target()
+    )
+
+    ensure_series_table(
+        client=client,
+        project_id=project_id,
+        dataset_id=dataset_id,
+    )
+
+    return load_series_via_staging(
         client=client,
         dataframe=warehouse_df,
         project_id=project_id,

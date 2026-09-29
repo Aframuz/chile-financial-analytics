@@ -9,3 +9,70 @@ sources:
     tables:
 
       - name: observations
+
+      - name: series
+        description: >
+          Latest known metadata for one BCCh series. Loaded by
+          src/ingestion/series.py from the BCCh SearchSeries catalog
+          merged with curated metadata (metadata/bcch/series.yml).
+
+        columns:
+
+          - name: series_code
+            description: BCCh series code. Natural key.
+            tests:
+              - unique
+              - not_null
+
+          - name: series_name
+            description: Curated display name (e.g. USD/CLP).
+            tests:
+              - not_null
+
+          - name: description
+            description: Curated description.
+
+          - name: category
+            description: Curated category (e.g. Exchange Rate).
+            tests:
+              - not_null
+
+          - name: frequency
+            description: Frequency from the BCCh catalog, lowercased.
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['daily', 'monthly', 'quarterly', 'annual']
+
+          - name: unit
+            description: Curated unit (e.g. CLP per USD).
+            tests:
+              - not_null
+
+          - name: source_title_es
+            description: Spanish title as returned by BCCh.
+
+          - name: source_title_en
+            description: English title as returned by BCCh.
+
+          - name: first_observation_date
+            description: First available observation according to BCCh.
+
+          - name: last_observation_date
+            description: Last available observation according to BCCh.
+
+          - name: source_updated_date
+            description: Last update date reported by BCCh.
+
+          - name: extraction_date
+            tests:
+              - not_null
+
+          - name: extracted_at
+            tests:
+              - not_null
+
+          - name: source
+            tests:
+              - not_null

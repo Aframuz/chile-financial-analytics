@@ -45,3 +45,30 @@ clustered by `series_code`.
 
 Loads use a staging table followed by a BigQuery `MERGE`
 to support idempotent reruns and upstream revisions.
+
+`raw_bcch.series`
+
+**Grain:** latest known metadata for one Banco Central series.
+
+Natural key:
+
+- `series_code` (unique)
+
+Built by merging two sources:
+
+- the BCCh `SearchSeries` catalog (frequency, coverage dates, source titles)
+- curated metadata in `metadata/bcch/series.yml` (name, category, unit)
+
+`config/bcch_series.yml` decides *which* series are ingested;
+`metadata/bcch/series.yml` describes *what* they are.
+
+Raw artifacts are written to:
+
+raw/bcch/_series/extraction_date={YYYY-MM-DD}/
+
+### Running
+
+```bash
+python -m src.ingestion.observations   # raw_bcch.observations
+python -m src.ingestion.series         # raw_bcch.series
+```
