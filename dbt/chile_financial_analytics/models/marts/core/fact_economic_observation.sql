@@ -1,8 +1,46 @@
--- Grain: one observed value for one series on one date.
+{{
+    config(
+        materialized='incremental',
+
+        incremental_strategy='merge',
+
+        unique_key=[
+            'series_key',
+            'observation_date'
+        ],
+
+        partition_by={
+            'field': 'observation_date',
+            'data_type': 'date',
+            'granularity': 'day'
+        },
+
+        cluster_by=[
+            'series_key'
+        ]
+    )
+}}
+
+
 with observations as (
 
     select *
     from {{ ref('stg_bcch__observations') }}
+
+    {% if is_incremental() %}
+
+    where observation_date >= date_sub(
+        coalesce(
+            (
+                select max(observation_date)
+                from {{ this }}
+            ),
+            date('1900-01-01')
+        ),
+        interval 30 day
+    )
+    
+    {% endif %}
 
 ),
 
