@@ -5,10 +5,15 @@ import pandas as pd
 from google.cloud import bigquery
 
 from src.common.bigquery import (
+    delete_unconfigured_observations,
     ensure_observations_table,
     ensure_series_table,
     load_observations_via_staging,
     load_series_via_staging,
+)
+
+from src.common.timing import (
+    Timings,
 )
 
 from src.transforms.bcch import (
@@ -56,7 +61,9 @@ def publish_to_bigquery(
     df: pd.DataFrame,
     series_config: dict,
     extracted_at: datetime,
+    timings: Timings | None = None,
 ) -> int:
+    """MERGE one series' observations; returns rows changed."""
 
     if not bigquery_enabled():
         return 0
@@ -84,13 +91,40 @@ def publish_to_bigquery(
         dataframe=warehouse_df,
         project_id=project_id,
         dataset_id=dataset_id,
+        timings=timings,
+    )
+
+
+def prune_unconfigured_observations(
+    configured_codes: list[str],
+) -> int:
+    """Delete raw observations of series no longer in the config."""
+
+    if not bigquery_enabled():
+        return 0
+
+    client, project_id, dataset_id = (
+        bigquery_target()
+    )
+
+    return delete_unconfigured_observations(
+        client=client,
+        project_id=project_id,
+        dataset_id=dataset_id,
+        configured_codes=configured_codes,
     )
 
 
 def publish_series_to_bigquery(
     warehouse_df: pd.DataFrame,
+    configured_codes: list[str],
+    timings: Timings | None = None,
 ) -> int:
-    """Load canonical raw_bcch.series rows (see prepare_bcch_series)."""
+    """Load canonical raw_bcch.series rows (see prepare_bcch_series).
+
+    Series not in configured_codes are deleted from the table.
+    Returns rows changed.
+    """
 
     if not bigquery_enabled():
         return 0
@@ -113,4 +147,6 @@ def publish_series_to_bigquery(
         dataframe=warehouse_df,
         project_id=project_id,
         dataset_id=dataset_id,
+        configured_codes=configured_codes,
+        timings=timings,
     )

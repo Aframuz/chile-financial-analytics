@@ -10,6 +10,12 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
 
+# Correlate BigQuery jobs with dbt invocations and Airflow runs
+# (see macros/bcch_query_comment.sql).
+query-comment:
+  comment: "{{ bcch_query_comment(node) }}"
+  job-label: true
+
 clean-targets:
   - "target"
   - "dbt_packages"

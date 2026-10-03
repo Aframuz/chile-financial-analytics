@@ -154,7 +154,14 @@ models:
       - name: value
         tests:
           - not_null
-    
+
+      - name: extracted_at
+        description: >
+          When the source raw row last changed. Incremental runs process
+          raw rows newer than the max of this column, at any observation date.
+        tests:
+          - not_null
+
     data_tests:
 
       - dbt_utils.unique_combination_of_columns:

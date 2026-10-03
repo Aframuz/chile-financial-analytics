@@ -5,6 +5,8 @@ import pandas as pd
 import pytest
 
 from src.common.bigquery import (
+    OBSERVATIONS_KEY,
+    OBSERVATIONS_SCHEMA,
     SERIES_KEY,
     SERIES_SCHEMA,
     build_merge_query,
@@ -257,3 +259,64 @@ def test_series_merge_uses_series_code_as_key():
     assert "target.series_code = source.series_code" in query
     assert "series_code = source.series_code," not in query
     assert "category = source.category" in query
+
+
+def test_merge_only_updates_changed_rows():
+
+    query = build_merge_query(
+        target_table="p.raw_bcch.series",
+        staging_table="p.raw_bcch._staging_x",
+        schema=SERIES_SCHEMA,
+        key_columns=SERIES_KEY,
+    )
+
+    assert (
+        "target.category IS DISTINCT FROM source.category"
+        in query
+    )
+    # Audit columns don't count as a change...
+    assert "target.extracted_at IS DISTINCT FROM" not in query
+    assert "target.extraction_date IS DISTINCT FROM" not in query
+    # ...but are refreshed when something else changed
+    assert "extracted_at = source.extracted_at" in query
+
+
+def test_merge_without_delete_keeps_unmatched_rows():
+
+    query = build_merge_query(
+        target_table="p.raw_bcch.series",
+        staging_table="p.raw_bcch._staging_x",
+        schema=SERIES_SCHEMA,
+        key_columns=SERIES_KEY,
+    )
+
+    assert "NOT MATCHED BY SOURCE" not in query
+
+
+def test_merge_deletes_unmatched_except_retained_keys():
+
+    query = build_merge_query(
+        target_table="p.raw_bcch.series",
+        staging_table="p.raw_bcch._staging_x",
+        schema=SERIES_SCHEMA,
+        key_columns=SERIES_KEY,
+        delete_unmatched=True,
+    )
+
+    assert "WHEN NOT MATCHED BY SOURCE" in query
+    assert (
+        "target.series_code NOT IN UNNEST(@retained_keys)"
+        in query
+    )
+
+
+def test_merge_delete_requires_single_key():
+
+    with pytest.raises(ValueError):
+        build_merge_query(
+            target_table="p.raw_bcch.observations",
+            staging_table="p.raw_bcch._staging_x",
+            schema=OBSERVATIONS_SCHEMA,
+            key_columns=OBSERVATIONS_KEY,
+            delete_unmatched=True,
+        )

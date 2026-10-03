@@ -84,3 +84,64 @@ def test_gcs_publisher_builds_expected_paths(
         "extraction_date=2026-09-26/"
         "data.json"
     )
+
+def test_gcs_publisher_adds_window_folder(
+    tmp_path,
+    monkeypatch,
+):
+
+    data_path = tmp_path / "data.json"
+    metadata_path = tmp_path / "metadata.json"
+
+    data_path.write_text("{}", encoding="utf-8")
+    metadata_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("STORAGE_BACKEND", "gcs")
+    monkeypatch.setenv("GCS_RAW_BUCKET", "test-bucket")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
+
+    monkeypatch.setattr(
+        publisher,
+        "GCSStorage",
+        FakeGCSStorage,
+    )
+
+    result = publisher.publish_artifacts(
+        data_path=data_path,
+        metadata_path=metadata_path,
+        series_name="usd_clp",
+        extraction_date="2026-10-01",
+        window="2019-01-01_2019-01-31",
+    )
+
+    assert result["data_uri"] == (
+        "gs://test-bucket/"
+        "raw/bcch/"
+        "usd_clp/"
+        "extraction_date=2026-10-01/"
+        "window=2019-01-01_2019-01-31/"
+        "data.json"
+    )
+
+
+def test_run_summary_is_mirrored_under_runs_prefix(
+    tmp_path,
+    monkeypatch,
+):
+
+    from pathlib import Path
+
+    summary = Path("data/_runs/bcch/run_date=2026-10-03/r1.json")
+
+    monkeypatch.setenv("STORAGE_BACKEND", "gcs")
+    monkeypatch.setenv("GCS_RAW_BUCKET", "test-bucket")
+
+    monkeypatch.setattr(
+        publisher,
+        "GCSStorage",
+        FakeGCSStorage,
+    )
+
+    uri = publisher.publish_run_summary(summary)
+
+    assert uri == "gs://test-bucket/_runs/bcch/run_date=2026-10-03/r1.json"

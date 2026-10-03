@@ -17,6 +17,10 @@
 
         cluster_by=[
             'series_key'
+        ],
+
+        post_hook=[
+            "{{ delete_stale_observations() }}"
         ]
     )
 }}
@@ -29,17 +33,16 @@ with observations as (
 
     {% if is_incremental() %}
 
-    where observation_date >= date_sub(
-        coalesce(
-            (
-                select max(observation_date)
-                from {{ this }}
-            ),
-            date('1900-01-01')
-        ),
-        interval 30 day
+    -- New and revised raw rows since the last build, at any observation
+    -- date: late-arriving monthly values and old revisions included.
+    where extracted_at > (
+        select coalesce(
+            max(extracted_at),
+            timestamp('1900-01-01')
+        )
+        from {{ this }}
     )
-    
+
     {% endif %}
 
 ),
@@ -66,7 +69,9 @@ select
 
     observations.observation_date,
 
-    observations.value
+    observations.value,
+
+    observations.extracted_at
 
 from observations
 

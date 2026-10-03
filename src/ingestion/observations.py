@@ -3,9 +3,11 @@
 BCCh → validate → data/raw/bcch/{series_name}/ → GCS → raw_bcch.observations
 """
 
+import argparse
 import logging
+import os
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -26,7 +28,33 @@ from src.common.publisher import (
     publish_artifacts,
 )
 
+from src.common.exit_codes import (
+    exit_code_for,
+    is_retryable,
+    run_entrypoint,
+)
+
+from src.common.logging_config import (
+    configure_logging,
+    run_context,
+)
+
+from src.common.redaction import (
+    safe_error_message,
+)
+
+from src.common.timing import (
+    Timings,
+)
+
+from src.common.retry import (
+    RetryStats,
+    call_with_retries,
+)
+
 from src.common.warehouse import (
+    bigquery_enabled,
+    prune_unconfigured_observations,
     publish_to_bigquery,
 )
 
@@ -35,20 +63,21 @@ from src.ingestion.bcch import (
     RAW_DATA_DIR,
     RUNS_DIR,
     create_client,
+    enabled_series,
+    RunResult,
     load_config,
+    make_run_id,
+    upload_run_summary,
+    print_report,
+    step_report,
     resolve_end_date,
     save_run_summary,
     validate_config,
 )
 
 
-# LOGGING
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-logger = logging.getLogger(__name__)
+# __spec__.name keeps the module path when run with `python -m`
+logger = logging.getLogger(__spec__.name if __spec__ else __name__)
 
 # ==================================
 # FUNCTIONS
@@ -60,6 +89,7 @@ def extract_series(
     series_name: str,
     start_date: str,
     end_date: str,
+    retry_stats: RetryStats | None = None,
 ) -> pd.DataFrame:
 
     """Extract a series from the BCCH API."""
@@ -74,11 +104,15 @@ def extract_series(
     )
 
     # Extract the series data from the BCCH API
-    df = client.cuadro(
-        series=[series_code],
-        nombres=[series_name],
-        desde=start_date,
-        hasta=end_date,
+    df = call_with_retries(
+        lambda: client.cuadro(
+            series=[series_code],
+            nombres=[series_name],
+            desde=start_date,
+            hasta=end_date,
+        ),
+        description=f"BCCh extraction of {series_name}",
+        stats=retry_stats,
     )
 
     return df
@@ -86,13 +120,24 @@ def extract_series(
 def build_output_dir(
     series_name: str,
     extraction_date: str,
+    window: str | None = None,
 ) -> Path:
-    """Build the output directory path for the extracted data."""
-    return (
+    """Build the output directory path for the extracted data.
+
+    Explicit windows (backfills, reloads) get their own subfolder so
+    several windows extracted on the same day don't overwrite each other.
+    """
+
+    output_dir = (
         RAW_DATA_DIR
         / series_name
         / f"extraction_date={extraction_date}"
     )
+
+    if window:
+        output_dir = output_dir / f"window={window}"
+
+    return output_dir
 
 def save_raw(
     df: pd.DataFrame,
@@ -196,8 +241,28 @@ def ingest_series(
     series_config: dict[str, Any],
     end_date: str,
     run_started_at: datetime,
+    window: str | None = None,
+    timings: Timings | None = None,
+    retry_stats: RetryStats | None = None,
 ) -> dict[str, Any]:
-    """Ingest a single series based on the provided configuration."""
+    """Ingest a single series based on the provided configuration.
+
+    window: set for an explicitly requested date window ("START_END").
+    Raw files then land in a window= subfolder, and an empty extraction
+    is a valid "no data" result rather than a quality failure (e.g. a
+    monthly series with no observation dated inside a short window).
+
+    timings: filled with seconds per step (extract, validate, write_raw,
+    publish, warehouse); pass one in to keep them if a step raises.
+    retry_stats: BCCh API retries and waits, likewise.
+    """
+
+    if timings is None:
+        timings = Timings()
+
+    if retry_stats is None:
+        retry_stats = RetryStats()
+
     series_name = (
         series_config["name"]
     )
@@ -210,25 +275,43 @@ def ingest_series(
         series_config["start_date"]
     )
 
-    logger.info(
-        "Starting ingestion for %s",
-        series_name,
-    )
+    with timings.measure("extract"):
+        df = extract_series(
+            client=client,
+            series_code=series_code,
+            series_name=series_name,
+            start_date=start_date,
+            end_date=end_date,
+            retry_stats=retry_stats,
+        )
 
-    df = extract_series(
-        client=client,
-        series_code=series_code,
-        series_name=series_name,
-        start_date=start_date,
-        end_date=end_date,
-    )
+    if df.empty and window is not None:
 
-    validation = validate_series_data(
-        df=df,
-        series_config=series_config,
-        start_date=start_date,
-        end_date=end_date,
-    )
+        logger.info(
+            "No observations for %s between %s and %s (%s)",
+            series_name,
+            start_date,
+            end_date,
+            timings.describe(),
+        )
+
+        return {
+            "series_name": series_name,
+            "series_code": series_code,
+            "status": "success",
+            "row_count": 0,
+            "rows_changed": 0,
+            "timings_seconds": timings,
+            "api_retries": retry_stats.as_dict(),
+        }
+
+    with timings.measure("validate"):
+        validation = validate_series_data(
+            df=df,
+            series_config=series_config,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
     extraction_date = (
         run_started_at
@@ -239,31 +322,35 @@ def ingest_series(
     output_dir = build_output_dir(
         series_name=series_name,
         extraction_date=extraction_date,
+        window=window,
     )
 
-    data_path, checksum = save_raw(
-        df=df,
-        output_dir=output_dir,
-    )
+    with timings.measure("write_raw"):
 
-    metadata_path = save_metadata(
-        df=df,
-        series_config=series_config,
-        start_date=start_date,
-        end_date=end_date,
-        extracted_at=run_started_at,
-        output_dir=output_dir,
-        checksum=checksum,
-        validation=validation,
-    )
+        data_path, checksum = save_raw(
+            df=df,
+            output_dir=output_dir,
+        )
 
-    published = publish_artifacts(
-        data_path=data_path,
-        metadata_path=metadata_path,
-        series_name=series_name,
-        extraction_date=extraction_date,
-    )
+        metadata_path = save_metadata(
+            df=df,
+            series_config=series_config,
+            start_date=start_date,
+            end_date=end_date,
+            extracted_at=run_started_at,
+            output_dir=output_dir,
+            checksum=checksum,
+            validation=validation,
+        )
 
+    with timings.measure("publish"):
+        published = publish_artifacts(
+            data_path=data_path,
+            metadata_path=metadata_path,
+            series_name=series_name,
+            extraction_date=extraction_date,
+            window=window,
+        )
 
     status = (
         "success"
@@ -271,30 +358,39 @@ def ingest_series(
         else "quality_failed"
     )
 
-    warehouse_rows = 0
+    rows_changed = 0
 
     if validation["passed"]:
 
+        with timings.measure("warehouse"):
+            rows_changed = publish_to_bigquery(
+                df=df,
+                series_config=series_config,
+                extracted_at=run_started_at,
+                timings=timings,
+            )
+
         logger.info(
-            "Completed %s: "
-            "%s rows written to %s",
+            "Loaded %s: %s rows extracted, %s changed in warehouse, "
+            "raw at %s (%s)",
             series_name,
             len(df),
-            data_path,
-        )
-
-        warehouse_rows = publish_to_bigquery(
-            df=df,
-            series_config=series_config,
-            extracted_at=run_started_at,
+            rows_changed,
+            published["data_uri"],
+            timings.describe(),
         )
 
     else:
 
+        # Raw files are kept as evidence; nothing reaches the warehouse.
         logger.error(
-            "Data-quality validation "
-            "failed for %s",
+            "Data-quality validation failed for %s: %s",
             series_name,
+            "; ".join(
+                f"{check['name']} ({check['message']})"
+                for check in validation["checks"]
+                if not check["passed"]
+            ),
         )
 
     return {
@@ -308,13 +404,99 @@ def ingest_series(
         "metadata_uri": published["metadata_uri"],
         "checksum_sha256": checksum,
         "quality_passed":validation["passed"],
-        "warehouse_rows": warehouse_rows,
+        "rows_changed": rows_changed,
+        "timings_seconds": timings,
+        "api_retries": retry_stats.as_dict(),
     }
 
 # =======================
 # MAIN
 # =======================
-def main() -> int:
+def iso_date(value: str) -> str:
+    """Validate a YYYY-MM-DD string and return it unchanged."""
+
+    return date.fromisoformat(value).isoformat()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ingest BCCh observations.",
+    )
+
+    parser.add_argument(
+        "--start-date",
+        type=iso_date,
+        help=(
+            "First observation date to request (YYYY-MM-DD) for every "
+            "series. Defaults to each series' configured start_date "
+            "(full history, which also picks up revisions and late "
+            "monthly values)."
+        ),
+    )
+
+    parser.add_argument(
+        "--end-date",
+        type=iso_date,
+        help=(
+            "Last observation date to request (YYYY-MM-DD). "
+            "Overrides defaults.end_date in the config; "
+            "defaults to today (UTC)."
+        ),
+    )
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    configure_logging()
+
+    result = run_observations(
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
+
+    print_report(step_report(result))
+
+    return result.exit_code
+
+
+def run_observations(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> RunResult:
+    """Extract, validate and load observations for a date window.
+
+    start_date: None re-extracts each series from its configured
+    start_date. end_date: None uses defaults.end_date, else today (UTC).
+    Returns the exit code (see src/common/exit_codes.py) and summary path.
+    """
+
+    run_started_at = datetime.now(
+        timezone.utc
+    )
+
+    with run_context(make_run_id(run_started_at)):
+        return _run_observations(
+            start_date=start_date,
+            end_date=end_date,
+            run_started_at=run_started_at,
+        )
+
+
+def _run_observations(
+    start_date: str | None,
+    end_date: str | None,
+    run_started_at: datetime,
+) -> RunResult:
+
+    if start_date is not None:
+        start_date = iso_date(start_date)
+
+    if end_date is not None:
+        end_date = iso_date(end_date)
+
     results: list[dict[str, Any]] = []
 
     config = load_config(CONFIG_PATH)
@@ -323,10 +505,6 @@ def main() -> int:
 
     client = create_client()
 
-    run_started_at = datetime.now(
-        timezone.utc
-    )
-
     configured_end_date = (
         config
         .get("defaults", {})
@@ -334,7 +512,22 @@ def main() -> int:
     )
 
     end_date = resolve_end_date(
-        configured_end_date
+        end_date or configured_end_date
+    )
+
+    if start_date is not None and start_date > end_date:
+        raise ValueError(
+            f"start_date {start_date} is after end_date {end_date}."
+        )
+
+    logger.info(
+        "Starting observations run: window=%s → %s, series=%s, "
+        "storage=%s, bigquery=%s",
+        start_date or "configured start_date",
+        end_date,
+        [s["name"] for s in enabled_series(config)],
+        os.getenv("STORAGE_BACKEND", "local").lower(),
+        bigquery_enabled(),
     )
 
     for series_config in config["series"]:
@@ -351,13 +544,29 @@ def main() -> int:
 
             continue
 
+        timings = Timings()
+        retry_stats = RetryStats()
+
         try:
+
+            if start_date is not None:
+                series_config = {
+                    **series_config,
+                    "start_date": start_date,
+                }
 
             result = ingest_series(
                 client=client,
                 series_config=series_config,
                 end_date=end_date,
                 run_started_at=run_started_at,
+                window=(
+                    f"{start_date}_{end_date}"
+                    if start_date is not None
+                    else None
+                ),
+                timings=timings,
+                retry_stats=retry_stats,
             )
 
             results.append(result)
@@ -366,8 +575,9 @@ def main() -> int:
 
             logger.exception(
                 "Technical failure while "
-                "ingesting %s",
+                "ingesting %s (%s)",
                 series_config["name"],
+                timings.describe() or "before any step finished",
             )
 
             results.append(
@@ -382,9 +592,55 @@ def main() -> int:
                         "technical_failed",
 
                     "error":
-                        str(exc),
+                        safe_error_message(exc),
+
+                    "retryable":
+                        is_retryable(exc),
+
+                    "timings_seconds":
+                        timings,
+
+                    "api_retries":
+                        retry_stats.as_dict(),
                 }
             )
+
+    configured_codes = [
+        series_config["code"]
+        for series_config in enabled_series(config)
+    ]
+
+    pruned_rows = 0
+
+    try:
+
+        pruned_rows = prune_unconfigured_observations(
+            configured_codes
+        )
+
+        if bigquery_enabled():
+            logger.info(
+                "Pruned observations of unconfigured series: "
+                "%s rows deleted",
+                pruned_rows,
+            )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Technical failure while pruning "
+            "unconfigured series"
+        )
+
+        results.append(
+            {
+                "series_name": "_prune_unconfigured",
+                "series_code": None,
+                "status": "technical_failed",
+                "error": safe_error_message(exc),
+                "retryable": is_retryable(exc),
+            }
+        )
 
     ended_at = datetime.now(
     timezone.utc
@@ -397,24 +653,24 @@ def main() -> int:
         pipeline="bcch_ingestion",
         runs_dir=RUNS_DIR,
         details={
+            "requested_start_date": start_date,
             "requested_end_date": end_date,
         },
+        rows_changed=(
+            sum(
+                result.get("rows_changed") or 0
+                for result in results
+            )
+            + pruned_rows
+        ),
     )
 
-    has_failures = any(
-        result["status"] != "success"
-        for result in results
+
+    return RunResult(
+        exit_code=exit_code_for(results),
+        summary_path=summary_path,
+        summary_uri=upload_run_summary(summary_path),
     )
-
-    logger.info(
-        "Run summary written to %s",
-        summary_path,
-    )
-
-    if has_failures:
-        return 1
-
-    return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_entrypoint(main))

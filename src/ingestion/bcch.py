@@ -6,8 +6,11 @@ Used by both BCCh pipelines:
 - src.ingestion.series       → raw_bcch.series
 """
 
+import json
+import logging
 import os
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,10 +20,20 @@ import yaml
 
 from dotenv import load_dotenv
 
+from src.common.logging_config import (
+    current_parent_run_id,
+)
+
+from src.common.publisher import (
+    publish_run_summary,
+)
+
 from src.common.storage import (
     write_json_atomic,
 )
 
+
+logger = logging.getLogger(__name__)
 
 # PATHS
 CONFIG_PATH = Path("config/bcch_series.yml")
@@ -125,6 +138,12 @@ def resolve_end_date(
 
     return datetime.now(timezone.utc).date().isoformat()
 
+def make_run_id(started_at: datetime) -> str:
+    """Run id: the start timestamp, also the run summary's file name."""
+
+    return started_at.strftime("%Y%m%dT%H%M%S%fZ")
+
+
 def save_run_summary(
     results: list[dict[str, Any]],
     started_at: datetime,
@@ -132,12 +151,21 @@ def save_run_summary(
     pipeline: str,
     runs_dir: Path,
     details: dict[str, Any] | None = None,
+    rows_changed: int | None = None,
 ) -> Path:
-    """Write a JSON summary of a pipeline run, one result per series."""
+    """Write a JSON summary of a pipeline run, one result per series.
 
-    run_id = started_at.strftime(
-        "%Y%m%dT%H%M%S%fZ"
-    )
+    rows_changed: warehouse rows the run changed; defaults to the sum
+    of the per-series values.
+    """
+
+    if rows_changed is None:
+        rows_changed = sum(
+            result.get("rows_changed") or 0
+            for result in results
+        )
+
+    run_id = make_run_id(started_at)
 
     success_count = sum(
         result["status"] == "success"
@@ -167,6 +195,8 @@ def save_run_summary(
 
     summary = {
         "run_id": run_id,
+        # Set when run as a step of src.pipelines.bcch
+        "parent_run_id": current_parent_run_id(),
         "pipeline": pipeline,
 
         "status":
@@ -178,7 +208,13 @@ def save_run_summary(
         "ended_at_utc":
             ended_at.isoformat(),
 
+        "duration_seconds":
+            round((ended_at - started_at).total_seconds(), 3),
+
         **(details or {}),
+
+        "rows_changed":
+            rows_changed,
 
         "total_series":
             len(results),
@@ -211,4 +247,82 @@ def save_run_summary(
         path=output_path,
     )
 
+    logger.log(
+        logging.INFO if overall_status == "success" else logging.ERROR,
+        "Run finished: status=%s, success=%s, quality_failed=%s, "
+        "technical_failed=%s, rows_changed=%s, duration=%.1fs, summary=%s",
+        overall_status,
+        success_count,
+        quality_failed_count,
+        technical_failed_count,
+        rows_changed,
+        summary["duration_seconds"],
+        output_path,
+    )
+
     return output_path
+
+
+@dataclass(frozen=True)
+class RunResult:
+    """Outcome of one ingestion run: exit code + where its summary is."""
+
+    exit_code: int
+    summary_path: Path
+    summary_uri: str | None = None
+
+
+def upload_run_summary(summary_path: Path) -> str | None:
+    """Copy the run summary next to the raw data (GCS when configured).
+
+    Observability, not data: a failed upload is logged, not fatal; the
+    local summary still exists.
+    """
+
+    try:
+        return publish_run_summary(summary_path)
+
+    except Exception:
+        logger.exception(
+            "Could not upload run summary %s",
+            summary_path,
+        )
+        return None
+
+
+def step_report(result: RunResult) -> dict[str, Any]:
+    """Small, orchestrator-facing view of a run summary."""
+
+    summary = json.loads(
+        result.summary_path.read_text(encoding="utf-8")
+    )
+
+    return {
+        "run_id": summary["run_id"],
+        "pipeline": summary["pipeline"],
+        "status": summary["status"],
+        "exit_code": result.exit_code,
+        "rows_changed": summary["rows_changed"],
+        "duration_seconds": summary["duration_seconds"],
+        "parent_run_id": summary["parent_run_id"],
+        # Batch-level (series) or summed per series (observations)
+        "api_retries": (
+            summary["api_retries"]["retries"]
+            if "api_retries" in summary
+            else sum(
+                (result.get("api_retries") or {}).get("retries", 0)
+                for result in summary["results"]
+            )
+        ),
+        "summary_path": str(result.summary_path),
+        "summary_uri": result.summary_uri,
+    }
+
+
+def print_report(report: dict[str, Any]) -> None:
+    """Print the report as the process's last stdout line.
+
+    Orchestrators read it (Airflow pushes it to XCom); logs go to stderr.
+    """
+
+    print(json.dumps(report), flush=True)

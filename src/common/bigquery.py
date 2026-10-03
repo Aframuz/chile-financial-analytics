@@ -1,8 +1,33 @@
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+
 from google.cloud import bigquery
 
 from google.api_core.exceptions import NotFound
 
 import uuid
+
+from src.common.logging_config import (
+    airflow_context,
+    current_parent_run_id,
+    current_run_id,
+)
+from src.common.timing import Timings
+
+logger = logging.getLogger(__name__)
+
+LABEL_INVALID_CHARS = re.compile(r"[^a-z0-9_-]")
+
+# When a row was extracted, not what was extracted: excluded from change
+# detection so unchanged rows keep the timestamp of their last real change.
+AUDIT_COLUMNS = {
+    "extraction_date",
+    "extracted_at",
+}
+
+# Safety net: staging tables outlive a killed process (no `finally`).
+STAGING_TABLE_TTL = timedelta(hours=1)
 
 OBSERVATIONS_SCHEMA = [
     bigquery.SchemaField(
@@ -139,6 +164,44 @@ SERIES_KEY = [
 # GENERIC
 # ==================================
 
+def _label_value(value: str) -> str:
+    """BigQuery label values: lowercase letters, digits, _ and -; ≤ 63."""
+
+    return LABEL_INVALID_CHARS.sub("_", str(value).lower())[:63]
+
+
+def job_labels() -> dict[str, str]:
+    """Labels linking a BigQuery job to its pipeline run and Airflow task.
+
+    Query them in INFORMATION_SCHEMA.JOBS to find a run's jobs or cost:
+        WHERE EXISTS (SELECT 1 FROM UNNEST(labels)
+                      WHERE key = 'run_id' AND value = '20261003t…')
+    """
+
+    labels = {"pipeline": "bcch"}
+
+    if run_id := current_run_id():
+        labels["run_id"] = run_id
+
+    if parent_run_id := current_parent_run_id():
+        labels["parent_run_id"] = parent_run_id
+
+    if airflow := airflow_context():
+        labels.update(
+            {
+                "airflow_dag_id": airflow["dag_id"],
+                "airflow_run_id": airflow["run_id"],
+                "airflow_task_id": airflow["task_id"],
+                "airflow_try_number": airflow["try_number"],
+            }
+        )
+
+    return {
+        key: _label_value(value)
+        for key, value in labels.items()
+    }
+
+
 def ensure_table(
     client: bigquery.Client,
     table_id: str,
@@ -173,6 +236,13 @@ def ensure_table(
             clustering_fields
         )
 
+    logger.info(
+        "Creating table %s (partitioned by %s, clustered by %s)",
+        table_id,
+        partition_field,
+        clustering_fields,
+    )
+
     return client.create_table(table)
 
 
@@ -181,7 +251,17 @@ def build_merge_query(
     staging_table: str,
     schema: list[bigquery.SchemaField],
     key_columns: list[str],
+    delete_unmatched: bool = False,
 ) -> str:
+    """Upsert staging rows into the target on key_columns.
+
+    Matched rows are only updated when a non-audit column changed, so
+    `extracted_at` records when a row last changed, and downstream
+    incremental models can pick up exactly the new and revised rows.
+
+    delete_unmatched: also delete target rows missing from staging,
+    except keys in the @retained_keys query parameter (single key only).
+    """
 
     columns = [
         field.name
@@ -191,6 +271,13 @@ def build_merge_query(
     on_clause = "\n        AND ".join(
         f"target.{column} = source.{column}"
         for column in key_columns
+    )
+
+    changed_clause = "\n            OR ".join(
+        f"target.{column} IS DISTINCT FROM source.{column}"
+        for column in columns
+        if column not in key_columns
+        and column not in AUDIT_COLUMNS
     )
 
     update_clause = ",\n            ".join(
@@ -208,6 +295,21 @@ def build_merge_query(
         for column in columns
     )
 
+    delete_clause = ""
+
+    if delete_unmatched:
+
+        if len(key_columns) != 1:
+            raise ValueError(
+                "delete_unmatched requires a single key column."
+            )
+
+        delete_clause = f"""
+    WHEN NOT MATCHED BY SOURCE
+        AND target.{key_columns[0]} NOT IN UNNEST(@retained_keys) THEN
+        DELETE
+    """
+
     return f"""
     MERGE `{target_table}` AS target
 
@@ -216,7 +318,9 @@ def build_merge_query(
     ON
         {on_clause}
 
-    WHEN MATCHED THEN
+    WHEN MATCHED AND (
+            {changed_clause}
+        ) THEN
         UPDATE SET
             {update_clause}
 
@@ -227,7 +331,7 @@ def build_merge_query(
         VALUES (
             {insert_values}
         )
-    """
+    {delete_clause}"""
 
 
 def load_via_staging(
@@ -238,12 +342,28 @@ def load_via_staging(
     table_name: str,
     schema: list[bigquery.SchemaField],
     key_columns: list[str],
+    retained_keys: list[str] | None = None,
+    timings: Timings | None = None,
 ) -> int:
     """Load into a staging table, then MERGE on key_columns.
 
     Idempotent: reruns update matched rows
     instead of duplicating them.
+
+    retained_keys: when given, target rows missing from the dataframe
+    are deleted unless their key is listed here.
+
+    Returns the rows the MERGE changed (inserted, updated or deleted);
+    unchanged rows aren't touched, so a rerun with no news returns 0.
+
+    timings: filled with seconds per BigQuery stage (bq_staging,
+    bq_load, bq_merge, bq_cleanup).
     """
+
+    if timings is None:
+        timings = Timings()
+
+    labels = job_labels()
 
     target_table = (
         f"{project_id}."
@@ -258,45 +378,105 @@ def load_via_staging(
         f"{uuid.uuid4().hex}"
     )
 
-    job_config = (
-        bigquery.LoadJobConfig(
-            schema=schema,
-            write_disposition=(
-                bigquery.WriteDisposition
-                .WRITE_TRUNCATE
-            ),
-        )
+    staging = bigquery.Table(
+        staging_table,
+        schema=schema,
     )
 
-    load_job = (
-        client.load_table_from_dataframe(
-            dataframe,
-            staging_table,
-            job_config=job_config,
-        )
+    staging.expires = (
+        datetime.now(timezone.utc)
+        + STAGING_TABLE_TTL
     )
 
-    load_job.result()
+    staging.labels = labels
+
+    with timings.measure("bq_staging"):
+        client.create_table(staging)
 
     try:
+
+        job_config = (
+            bigquery.LoadJobConfig(
+                schema=schema,
+                write_disposition=(
+                    bigquery.WriteDisposition
+                    .WRITE_APPEND
+                ),
+                labels=labels,
+            )
+        )
+
+        with timings.measure("bq_load"):
+
+            load_job = (
+                client.load_table_from_dataframe(
+                    dataframe,
+                    staging_table,
+                    job_config=job_config,
+                )
+            )
+
+            load_job.result()
 
         query = build_merge_query(
             target_table=target_table,
             staging_table=staging_table,
             schema=schema,
             key_columns=key_columns,
+            delete_unmatched=retained_keys is not None,
         )
 
-        client.query(query).result()
+        query_config = bigquery.QueryJobConfig(
+            query_parameters=(
+                [
+                    bigquery.ArrayQueryParameter(
+                        "retained_keys",
+                        "STRING",
+                        retained_keys,
+                    )
+                ]
+                if retained_keys is not None
+                else []
+            ),
+            labels=labels,
+        )
+
+        with timings.measure("bq_merge"):
+
+            merge_job = client.query(
+                query,
+                job_config=query_config,
+            )
+
+            merge_job.result()
 
     finally:
 
-        client.delete_table(
-            staging_table,
-            not_found_ok=True,
-        )
+        with timings.measure("bq_cleanup"):
+            client.delete_table(
+                staging_table,
+                not_found_ok=True,
+            )
 
-    return len(dataframe)
+    rows_changed = merge_job.num_dml_affected_rows or 0
+
+    # Job ids open the exact jobs in the BigQuery console / INFORMATION_SCHEMA.
+    logger.info(
+        "MERGE into %s: %s rows sent, %s changed "
+        "(load job %s, merge job %s, %s bytes processed; %s)",
+        target_table,
+        len(dataframe),
+        rows_changed,
+        load_job.job_id,
+        merge_job.job_id,
+        merge_job.total_bytes_processed,
+        ", ".join(
+            f"{stage} {timings[stage]:.2f}s"
+            for stage in ("bq_staging", "bq_load", "bq_merge", "bq_cleanup")
+        ),
+    )
+
+    return rows_changed
 
 
 # ==================================
@@ -361,9 +541,11 @@ def load_observations_via_staging(
     dataframe,
     project_id: str,
     dataset_id: str,
+    timings: Timings | None = None,
 ) -> int:
 
     return load_via_staging(
+        timings=timings,
         client=client,
         dataframe=dataframe,
         project_id=project_id,
@@ -372,6 +554,58 @@ def load_observations_via_staging(
         schema=OBSERVATIONS_SCHEMA,
         key_columns=OBSERVATIONS_KEY,
     )
+
+
+def delete_unconfigured_observations(
+    client: bigquery.Client,
+    project_id: str,
+    dataset_id: str,
+    configured_codes: list[str],
+) -> int:
+    """Delete observations of series no longer configured.
+
+    Keeps raw_bcch.observations consistent with raw_bcch.series, which
+    drops unconfigured series in its MERGE.
+    """
+
+    if not configured_codes:
+        raise ValueError(
+            "Refusing to prune observations: no configured series."
+        )
+
+    query = f"""
+    DELETE FROM `{project_id}.{dataset_id}.observations`
+    WHERE series_code NOT IN UNNEST(@configured_codes)
+    """
+
+    job = client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            labels=job_labels(),
+            query_parameters=[
+                bigquery.ArrayQueryParameter(
+                    "configured_codes",
+                    "STRING",
+                    configured_codes,
+                )
+            ]
+        ),
+    )
+
+    job.result()
+
+    rows_deleted = job.num_dml_affected_rows or 0
+
+    logger.info(
+        "DELETE unconfigured series from %s.%s.observations: "
+        "%s rows deleted (job %s)",
+        project_id,
+        dataset_id,
+        rows_deleted,
+        job.job_id,
+    )
+
+    return rows_deleted
 
 
 # ==================================
@@ -402,7 +636,14 @@ def load_series_via_staging(
     dataframe,
     project_id: str,
     dataset_id: str,
+    configured_codes: list[str],
+    timings: Timings | None = None,
 ) -> int:
+    """MERGE series metadata; delete series no longer configured.
+
+    Configured series missing from the dataframe (e.g. failed
+    validation this run) keep their last known metadata.
+    """
 
     return load_via_staging(
         client=client,
@@ -412,4 +653,6 @@ def load_series_via_staging(
         table_name="series",
         schema=SERIES_SCHEMA,
         key_columns=SERIES_KEY,
+        retained_keys=configured_codes,
+        timings=timings,
     )

@@ -12,6 +12,7 @@ Which series to describe comes from config/bcch_series.yml
 """
 
 import logging
+import os
 
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -40,11 +41,41 @@ from src.common.publisher import (
     publish_artifacts,
 )
 
+from src.common.exit_codes import (
+    exit_code_for,
+    is_retryable,
+    run_entrypoint,
+)
+
+from src.common.logging_config import (
+    configure_logging,
+    run_context,
+)
+
+from src.common.redaction import (
+    safe_error_message,
+)
+
+from src.common.timing import (
+    Timings,
+)
+
+from src.common.retry import (
+    RetryStats,
+    call_with_retries,
+)
+
 from src.common.warehouse import (
+    bigquery_enabled,
     publish_series_to_bigquery,
 )
 
 from src.ingestion.bcch import (
+    make_run_id,
+    upload_run_summary,
+    RunResult,
+    print_report,
+    step_report,
     CONFIG_PATH,
     RAW_DATA_DIR,
     create_client,
@@ -64,13 +95,8 @@ SERIES_METADATA_DIR = "_series"
 
 RUNS_DIR = Path("data/_runs/bcch_series")
 
-# LOGGING
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-logger = logging.getLogger(__name__)
+# __spec__.name keeps the module path when run with `python -m`
+logger = logging.getLogger(__spec__.name if __spec__ else __name__)
 
 # ==================================
 # FUNCTIONS
@@ -114,6 +140,8 @@ def load_curated_metadata(
 
 def extract_catalog(
     client: bcchapi.Siete,
+    timings: Timings | None = None,
+    retry_stats: RetryStats | None = None,
 ) -> pd.DataFrame:
     """Extract the BCCh SearchSeries catalog for every frequency.
 
@@ -132,8 +160,17 @@ def extract_catalog(
             frequency,
         )
 
+        with (timings if timings is not None else Timings()).measure(
+            f"extract_{frequency.lower()}"
+        ):
+            response = call_with_retries(
+                lambda: session.search(frequency),
+                description=f"BCCh catalog search for {frequency}",
+                stats=retry_stats,
+            )
+
         frames.append(
-            session.search(frequency).to_df()
+            response.to_df()
         )
 
     return pd.concat(
@@ -231,10 +268,24 @@ def ingest_series_metadata(
     series_configs: list[dict[str, Any]],
     curated: dict[str, dict[str, Any]],
     run_started_at: datetime,
-) -> list[dict[str, Any]]:
-    """Ingest metadata for the configured series. Returns one result per series."""
+    timings: Timings | None = None,
+    retry_stats: RetryStats | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Ingest metadata for the configured series.
 
-    catalog = extract_catalog(client)
+    Returns one result per series, and the warehouse rows changed.
+    timings: filled with seconds per step for the whole batch.
+    """
+
+    if timings is None:
+        timings = Timings()
+
+    with timings.measure("extract"):
+        catalog = extract_catalog(
+            client,
+            timings=timings,
+            retry_stats=retry_stats,
+        )
 
     codes = [
         series_config["code"]
@@ -246,19 +297,20 @@ def ingest_series_metadata(
         .reset_index(drop=True)
     )
 
-    validations = {
-        series_config["code"]: validate_series_metadata(
-            series_config=series_config,
-            catalog_matches=source_records[
-                source_records["seriesId"]
-                == series_config["code"]
-            ],
-            curated=curated.get(
-                series_config["code"]
-            ),
-        )
-        for series_config in series_configs
-    }
+    with timings.measure("validate"):
+        validations = {
+            series_config["code"]: validate_series_metadata(
+                series_config=series_config,
+                catalog_matches=source_records[
+                    source_records["seriesId"]
+                    == series_config["code"]
+                ],
+                curated=curated.get(
+                    series_config["code"]
+                ),
+            )
+            for series_config in series_configs
+        }
 
     extraction_date = (
         run_started_at
@@ -270,26 +322,29 @@ def ingest_series_metadata(
         extraction_date=extraction_date,
     )
 
-    data_path, checksum = save_raw(
-        source_records=source_records,
-        output_dir=output_dir,
-    )
+    with timings.measure("write_raw"):
 
-    metadata_path = save_metadata(
-        source_records=source_records,
-        series_configs=series_configs,
-        extracted_at=run_started_at,
-        output_dir=output_dir,
-        checksum=checksum,
-        validations=validations,
-    )
+        data_path, checksum = save_raw(
+            source_records=source_records,
+            output_dir=output_dir,
+        )
 
-    published = publish_artifacts(
-        data_path=data_path,
-        metadata_path=metadata_path,
-        series_name=SERIES_METADATA_DIR,
-        extraction_date=extraction_date,
-    )
+        metadata_path = save_metadata(
+            source_records=source_records,
+            series_configs=series_configs,
+            extracted_at=run_started_at,
+            output_dir=output_dir,
+            checksum=checksum,
+            validations=validations,
+        )
+
+    with timings.measure("publish"):
+        published = publish_artifacts(
+            data_path=data_path,
+            metadata_path=metadata_path,
+            series_name=SERIES_METADATA_DIR,
+            extraction_date=extraction_date,
+        )
 
     passed_codes = [
         code
@@ -304,11 +359,11 @@ def ingest_series_metadata(
             logger.error(
                 "Metadata validation failed for %s: %s",
                 code,
-                [
-                    check["name"]
+                "; ".join(
+                    f"{check['name']} ({check['message']})"
                     for check in validation["checks"]
                     if not check["passed"]
-                ],
+                ),
             )
 
     warehouse_df = prepare_bcch_series(
@@ -319,19 +374,24 @@ def ingest_series_metadata(
         extracted_at=run_started_at,
     )
 
-    warehouse_rows = publish_series_to_bigquery(
-        warehouse_df=warehouse_df,
-    )
+    with timings.measure("warehouse"):
+        rows_changed = publish_series_to_bigquery(
+            warehouse_df=warehouse_df,
+            configured_codes=codes,
+            timings=timings,
+        )
 
     logger.info(
-        "Completed series metadata: "
-        "%s/%s series passed, %s rows loaded",
+        "Loaded series metadata: %s/%s series passed validation, "
+        "%s rows changed in warehouse, raw at %s (%s)",
         len(passed_codes),
         len(series_configs),
-        warehouse_rows,
+        rows_changed,
+        published["data_uri"],
+        timings.describe(),
     )
 
-    return [
+    results = [
         {
             "series_name": series_config["name"],
             "series_code": series_config["code"],
@@ -348,17 +408,47 @@ def ingest_series_metadata(
             "quality_passed":
                 validations[series_config["code"]]["passed"],
             "warehouse_loaded": (
-                warehouse_rows > 0
+                bigquery_enabled()
                 and series_config["code"] in passed_codes
             ),
         }
         for series_config in series_configs
     ]
 
+    # One MERGE for the whole batch: the count belongs to the run.
+    return results, rows_changed
+
 # =======================
 # MAIN
 # =======================
 def main() -> int:
+
+    configure_logging()
+
+    result = run_series()
+
+    print_report(step_report(result))
+
+    return result.exit_code
+
+
+def run_series() -> RunResult:
+    """Extract, validate and load series metadata (a catalog snapshot)."""
+
+    run_started_at = datetime.now(
+        timezone.utc
+    )
+
+    with run_context(make_run_id(run_started_at)):
+        return _run_series(run_started_at)
+
+
+def _run_series(run_started_at: datetime) -> RunResult:
+
+    rows_changed = 0
+
+    timings = Timings()
+    retry_stats = RetryStats()
 
     config = load_config(CONFIG_PATH)
 
@@ -384,17 +474,22 @@ def main() -> int:
 
     client = create_client()
 
-    run_started_at = datetime.now(
-        timezone.utc
+    logger.info(
+        "Starting series metadata run: series=%s, storage=%s, bigquery=%s",
+        [s["name"] for s in series_configs],
+        os.getenv("STORAGE_BACKEND", "local").lower(),
+        bigquery_enabled(),
     )
 
     try:
 
-        results = ingest_series_metadata(
+        results, rows_changed = ingest_series_metadata(
             client=client,
             series_configs=series_configs,
             curated=curated,
             run_started_at=run_started_at,
+            timings=timings,
+            retry_stats=retry_stats,
         )
 
     except Exception as exc:
@@ -403,7 +498,8 @@ def main() -> int:
         # a technical failure affects every series
         logger.exception(
             "Technical failure while "
-            "ingesting series metadata"
+            "ingesting series metadata (%s)",
+            timings.describe() or "before any step finished",
         )
 
         results = [
@@ -418,7 +514,10 @@ def main() -> int:
                     "technical_failed",
 
                 "error":
-                    str(exc),
+                    safe_error_message(exc),
+
+                "retryable":
+                    is_retryable(exc),
             }
             for series_config in series_configs
         ]
@@ -433,22 +532,19 @@ def main() -> int:
         ended_at=ended_at,
         pipeline="bcch_series_metadata",
         runs_dir=RUNS_DIR,
+        details={
+            "timings_seconds": timings,
+            "api_retries": retry_stats.as_dict(),
+        },
+        rows_changed=rows_changed,
     )
 
-    logger.info(
-        "Run summary written to %s",
-        summary_path,
+
+    return RunResult(
+        exit_code=exit_code_for(results),
+        summary_path=summary_path,
+        summary_uri=upload_run_summary(summary_path),
     )
-
-    has_failures = any(
-        result["status"] != "success"
-        for result in results
-    )
-
-    if has_failures:
-        return 1
-
-    return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_entrypoint(main))

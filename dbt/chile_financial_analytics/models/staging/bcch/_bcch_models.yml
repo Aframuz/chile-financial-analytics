@@ -96,6 +96,13 @@ models:
           Null on non-business days (weekends/holidays) for daily series,
           as returned by the BCCh API. Filtered out in fact_economic_observation.
 
+      - name: extracted_at
+        description: >
+          When the raw row last changed. The raw MERGE skips unchanged rows,
+          so this drives incremental loads of fact_economic_observation.
+        tests:
+          - not_null
+
     data_tests:
 
       # Grain: one observation per series per date
