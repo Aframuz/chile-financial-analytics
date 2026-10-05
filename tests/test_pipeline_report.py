@@ -20,6 +20,7 @@ def make_result(tmp_path, name, rows_changed, exit_code=EXIT_SUCCESS):
 
     path = save_run_summary(
         results=[{"status": "success", "rows_changed": rows_changed}],
+        run_id=f"{name}-run",
         started_at=datetime.now(timezone.utc),
         ended_at=datetime.now(timezone.utc),
         pipeline=name,
@@ -33,16 +34,27 @@ def test_summary_sums_rows_changed_unless_given(tmp_path):
 
     path = save_run_summary(
         results=[
-            {"status": "success", "rows_changed": 3},
-            {"status": "success", "rows_changed": 4},
+            {"status": "success", "row_count": 10, "valid_rows": 10, "loaded_rows": 10, "rows_changed": 3},
+            {"status": "quality_failed", "row_count": 5, "rejected_rows": 5, "rows_changed": 4,
+             "failed_checks": ["min_value"]},
         ],
+        run_id="test-run",
         started_at=datetime.now(timezone.utc),
         ended_at=datetime.now(timezone.utc),
         pipeline="test",
         runs_dir=tmp_path,
     )
 
-    assert json.loads(path.read_text())["rows_changed"] == 7
+    summary = json.loads(path.read_text())
+
+    assert summary["run_id"] == "test-run"
+    assert summary["rows_changed"] == 7
+    # Rows through each stage
+    assert summary["extracted_rows"] == 15
+    assert summary["valid_rows"] == 10
+    assert summary["rejected_rows"] == 5
+    assert summary["loaded_rows"] == 10
+    assert summary["error_message"] == "None: quality_failed (min_value)"
 
     report = step_report(RunResult(EXIT_SUCCESS, path))
 

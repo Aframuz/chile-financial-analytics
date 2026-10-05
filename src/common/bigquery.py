@@ -26,10 +26,32 @@ AUDIT_COLUMNS = {
     "extraction_date",
     "extracted_at",
     "ingested_at",
+    "ingestion_run_id",
 }
 
 # Safety net: staging tables outlive a killed process (no `finally`).
 STAGING_TABLE_TTL = timedelta(hours=1)
+
+# The ingestion run that last wrote the row (raw_bcch.ingestion_runs).
+# NULLABLE: added to existing tables (dbt tests it not_null).
+INGESTION_RUN_ID_FIELD = bigquery.SchemaField(
+    "ingestion_run_id",
+    "STRING",
+    mode="NULLABLE",
+)
+
+# Values for columns added to tables that already had rows, from what
+# those rows recorded. extracted_at is the run's start time, which
+# make_run_id formatted as the run id (before ids had a random suffix).
+LEGACY_BACKFILLS = {
+    "ingested_at": "extracted_at",
+    "ingestion_run_id": (
+        "CONCAT("
+        "FORMAT_TIMESTAMP('%Y%m%dT%H%M%S', extracted_at), "
+        "FORMAT('%06d', EXTRACT(MICROSECOND FROM extracted_at)), "
+        "'Z')"
+    ),
+}
 
 OBSERVATIONS_SCHEMA = [
     bigquery.SchemaField(
@@ -80,6 +102,7 @@ OBSERVATIONS_SCHEMA = [
         "TIMESTAMP",
         mode="NULLABLE",
     ),
+    INGESTION_RUN_ID_FIELD,
     bigquery.SchemaField(
         "source",
         "STRING",
@@ -163,10 +186,51 @@ SERIES_SCHEMA = [
         "STRING",
         mode="REQUIRED",
     ),
+    INGESTION_RUN_ID_FIELD,
 ]
 
 SERIES_KEY = [
     "series_code",
+]
+
+# monitoring.ingestion_runs: one audit row per ingestion execution,
+# written even when it fails. Pipeline history independent of Airflow's
+# metadata database; raw rows' ingestion_run_id points here.
+INGESTION_RUNS_SCHEMA = [
+    bigquery.SchemaField("run_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("source", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("started_at", "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("completed_at", "TIMESTAMP", mode="NULLABLE"),
+    # running → success | failed | crashed; unknown for runs that
+    # predate the table (only their id and start time are known)
+    bigquery.SchemaField("status", "STRING", mode="REQUIRED"),
+    # Fetched from BCCh
+    bigquery.SchemaField("extracted_rows", "INT64", mode="NULLABLE"),
+    # Passed validation / failed it (validation is per series: a
+    # failing series rejects all its rows)
+    bigquery.SchemaField("valid_rows", "INT64", mode="NULLABLE"),
+    bigquery.SchemaField("rejected_rows", "INT64", mode="NULLABLE"),
+    # Written to the warehouse by a committed MERGE
+    bigquery.SchemaField("loaded_rows", "INT64", mode="NULLABLE"),
+    # Short, redacted; full detail in the run summary (summary_uri)
+    bigquery.SchemaField("error_message", "STRING", mode="NULLABLE"),
+    # Context: where the run fits and where its details are
+    bigquery.SchemaField("pipeline", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("target_table", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("exit_code", "INT64", mode="NULLABLE"),
+    # Inserted, updated or deleted by the MERGE (0: nothing new)
+    bigquery.SchemaField("rows_changed", "INT64", mode="NULLABLE"),
+    bigquery.SchemaField("summary_uri", "STRING", mode="NULLABLE"),
+    # The src.pipelines.bcch run the step belonged to, if any
+    bigquery.SchemaField("parent_run_id", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("airflow_dag_id", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("airflow_run_id", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("airflow_task_id", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("airflow_try_number", "STRING", mode="NULLABLE"),
+]
+
+INGESTION_RUNS_KEY = [
+    "run_id",
 ]
 
 
@@ -538,50 +602,95 @@ def ensure_observations_table(
     client: bigquery.Client,
     project_id: str,
     dataset_id: str,
+    runs_dataset_id: str = "monitoring",
 ) -> bigquery.Table:
-
-    table_id = (
-        f"{project_id}."
-        f"{dataset_id}."
-        f"observations"
-    )
 
     table = ensure_table(
         client=client,
-        table_id=table_id,
+        table_id=(
+            f"{project_id}."
+            f"{dataset_id}."
+            f"observations"
+        ),
         schema=OBSERVATIONS_SCHEMA,
         partition_field="observation_date",
         clustering_fields=["series_code"],
     )
 
-    added = add_missing_columns(
+    migrate_table(
         client,
         table,
         OBSERVATIONS_SCHEMA,
+        pipeline="bcch_ingestion",
+        runs_dataset_id=runs_dataset_id,
     )
-
-    # One-off migration, in the run that adds the column
-    if "ingested_at" in added:
-        backfill_ingested_at(client, table_id)
 
     return table
 
 
-def backfill_ingested_at(
+def migrate_table(
+    client: bigquery.Client,
+    table: bigquery.Table,
+    schema: list[bigquery.SchemaField],
+    pipeline: str,
+    runs_dataset_id: str,
+) -> None:
+    """Bring a raw table created before its current schema up to date.
+
+    Adds missing columns and, in the run that adds them, backfills
+    LEGACY_BACKFILLS columns on existing rows. When that gives rows an
+    ingestion_run_id, logs those older runs in runs_dataset_id's
+    ingestion_runs so every row's run is listed there.
+    """
+
+    added = add_missing_columns(client, table, schema)
+
+    backfills = {
+        column: LEGACY_BACKFILLS[column]
+        for column in added
+        if column in LEGACY_BACKFILLS
+    }
+
+    if not backfills:
+        return
+
+    table_id = f"{table.project}.{table.dataset_id}.{table.table_id}"
+
+    backfill_columns(client, table_id, backfills)
+
+    if "ingestion_run_id" in backfills:
+        register_legacy_runs(
+            client,
+            table_id=table_id,
+            target_table=f"{table.dataset_id}.{table.table_id}",
+            pipeline=pipeline,
+            runs_dataset_id=runs_dataset_id,
+        )
+
+
+def backfill_columns(
     client: bigquery.Client,
     table_id: str,
+    expressions: dict[str, str],
 ) -> int:
-    """Set ingested_at on rows loaded before the column existed.
+    """Fill NULLs in each column with its SQL expression; return rows updated."""
 
-    Their best known load time is extracted_at: the run that wrote them
-    loaded within minutes of starting.
-    """
+    set_clause = ",\n            ".join(
+        f"{column} = COALESCE({column}, {expression})"
+        for column, expression in expressions.items()
+    )
+
+    where_clause = " OR ".join(
+        f"{column} IS NULL"
+        for column in expressions
+    )
 
     job = client.query(
         f"""
         UPDATE `{table_id}`
-        SET ingested_at = extracted_at
-        WHERE ingested_at IS NULL
+        SET
+            {set_clause}
+        WHERE {where_clause}
         """,
         job_config=bigquery.QueryJobConfig(
             labels=job_labels(),
@@ -592,16 +701,80 @@ def backfill_ingested_at(
 
     rows_updated = job.num_dml_affected_rows or 0
 
-    if rows_updated:
-        logger.info(
-            "Backfilled ingested_at from extracted_at on %s rows of %s "
-            "(job %s)",
-            rows_updated,
-            table_id,
-            job.job_id,
-        )
+    logger.info(
+        "Backfilled %s on %s rows of %s (job %s)",
+        sorted(expressions),
+        rows_updated,
+        table_id,
+        job.job_id,
+    )
 
     return rows_updated
+
+
+def register_legacy_runs(
+    client: bigquery.Client,
+    table_id: str,
+    target_table: str,
+    pipeline: str,
+    runs_dataset_id: str,
+) -> int:
+    """Log runs that wrote rows before ingestion_runs existed.
+
+    Only the id and start time are known (status unknown); details are
+    in the run summary named after the id, in GCS.
+    """
+
+    project_id, dataset_id, _ = table_id.split(".")
+
+    ensure_ingestion_runs_table(
+        client,
+        project_id,
+        runs_dataset_id,
+        location_of=dataset_id,
+    )
+
+    runs_table = f"{project_id}.{runs_dataset_id}.ingestion_runs"
+
+    job = client.query(
+        f"""
+        INSERT INTO `{runs_table}`
+            (run_id, source, pipeline, target_table, status, started_at)
+        SELECT
+            ingestion_run_id,
+            'bcch',
+            @pipeline,
+            @target_table,
+            'unknown',
+            MIN(extracted_at)
+        FROM `{table_id}`
+        WHERE ingestion_run_id NOT IN (
+            SELECT run_id FROM `{runs_table}`
+        )
+        GROUP BY ingestion_run_id
+        """,
+        job_config=bigquery.QueryJobConfig(
+            labels=job_labels(),
+            query_parameters=[
+                bigquery.ScalarQueryParameter("pipeline", "STRING", pipeline),
+                bigquery.ScalarQueryParameter("target_table", "STRING", target_table),
+            ],
+        ),
+    )
+
+    job.result()
+
+    rows_inserted = job.num_dml_affected_rows or 0
+
+    logger.info(
+        "Registered %s legacy runs of %s in %s (job %s)",
+        rows_inserted,
+        target_table,
+        runs_table,
+        job.job_id,
+    )
+
+    return rows_inserted
 
 
 def load_observations(
@@ -718,11 +891,12 @@ def ensure_series_table(
     client: bigquery.Client,
     project_id: str,
     dataset_id: str,
+    runs_dataset_id: str = "monitoring",
 ) -> bigquery.Table:
 
     # Small dimension-like table:
     # no partitioning or clustering needed
-    return ensure_table(
+    table = ensure_table(
         client=client,
         table_id=(
             f"{project_id}."
@@ -731,6 +905,16 @@ def ensure_series_table(
         ),
         schema=SERIES_SCHEMA,
     )
+
+    migrate_table(
+        client,
+        table,
+        SERIES_SCHEMA,
+        pipeline="bcch_series_metadata",
+        runs_dataset_id=runs_dataset_id,
+    )
+
+    return table
 
 
 def load_series_via_staging(
@@ -758,3 +942,155 @@ def load_series_via_staging(
         retained_keys=configured_codes,
         timings=timings,
     )
+
+
+# ==================================
+# monitoring.ingestion_runs
+# ==================================
+
+def ensure_dataset(
+    client: bigquery.Client,
+    project_id: str,
+    dataset_id: str,
+    location_of: str,
+) -> None:
+    """Create dataset_id if missing, in the same location as location_of.
+
+    Same location as the raw data, so queries can join both.
+    """
+
+    dataset_ref = f"{project_id}.{dataset_id}"
+
+    try:
+        client.get_dataset(dataset_ref)
+        return
+
+    except NotFound:
+        pass
+
+    dataset = bigquery.Dataset(dataset_ref)
+
+    dataset.location = client.get_dataset(
+        f"{project_id}.{location_of}"
+    ).location
+
+    logger.info(
+        "Creating dataset %s in %s",
+        dataset_ref,
+        dataset.location,
+    )
+
+    client.create_dataset(dataset, exists_ok=True)
+
+
+def ensure_ingestion_runs_table(
+    client: bigquery.Client,
+    project_id: str,
+    dataset_id: str,
+    location_of: str,
+) -> bigquery.Table:
+    """Create monitoring.ingestion_runs (and its dataset) if missing.
+
+    location_of: the raw dataset, whose location the dataset takes.
+    """
+
+    ensure_dataset(client, project_id, dataset_id, location_of)
+
+    # A few rows per day: no partitioning or clustering needed
+    return ensure_table(
+        client=client,
+        table_id=(
+            f"{project_id}."
+            f"{dataset_id}."
+            f"ingestion_runs"
+        ),
+        schema=INGESTION_RUNS_SCHEMA,
+    )
+
+
+def build_run_upsert_query(
+    table_id: str,
+    columns: list[str],
+    update_columns: list[str],
+) -> str:
+    """MERGE one ingestion_runs row from @-parameters, keyed on run_id.
+
+    Inserts the run if it's missing; update_columns are overwritten if
+    it exists (none: a rerun of the same statement changes nothing).
+    """
+
+    source_columns = ",\n            ".join(
+        f"@{column} AS {column}"
+        for column in columns
+    )
+
+    matched_clause = ""
+
+    if update_columns:
+
+        update_clause = ",\n            ".join(
+            f"{column} = source.{column}"
+            for column in update_columns
+        )
+
+        matched_clause = f"""
+    WHEN MATCHED THEN
+        UPDATE SET
+            {update_clause}
+    """
+
+    insert_columns = ", ".join(columns)
+
+    insert_values = ", ".join(
+        f"source.{column}"
+        for column in columns
+    )
+
+    return f"""
+    MERGE `{table_id}` AS target
+
+    USING (
+        SELECT
+            {source_columns}
+    ) AS source
+
+    ON target.run_id = source.run_id
+    {matched_clause}
+    WHEN NOT MATCHED THEN
+        INSERT ({insert_columns})
+        VALUES ({insert_values})
+    """
+
+
+def upsert_ingestion_run(
+    client: bigquery.Client,
+    project_id: str,
+    dataset_id: str,
+    run: dict,
+    update_columns: list[str],
+) -> None:
+    """Write one ingestion_runs row (see build_run_upsert_query)."""
+
+    types = {
+        field.name: field.field_type
+        for field in INGESTION_RUNS_SCHEMA
+    }
+
+    query = build_run_upsert_query(
+        table_id=f"{project_id}.{dataset_id}.ingestion_runs",
+        columns=list(run),
+        update_columns=update_columns,
+    )
+
+    job = client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            labels=job_labels(),
+            query_parameters=[
+                bigquery.ScalarQueryParameter(column, types[column], value)
+                for column, value in run.items()
+            ],
+        ),
+    )
+
+    job.result()

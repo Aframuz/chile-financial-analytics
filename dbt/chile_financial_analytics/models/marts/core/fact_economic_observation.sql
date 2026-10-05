@@ -1,3 +1,7 @@
+{#
+    on_schema_change: new columns reach the existing table on the next
+    incremental run, NULL for older rows until a one-off --full-refresh.
+#}
 {{
     config(
         materialized='incremental',
@@ -18,6 +22,8 @@
         cluster_by=[
             'series_key'
         ],
+
+        on_schema_change='append_new_columns',
 
         post_hook=[
             "{{ delete_stale_observations() }}"
@@ -71,7 +77,10 @@ select
 
     observations.value,
 
-    observations.extracted_at
+    observations.extracted_at,
+
+    -- Lineage: the ingestion run that wrote the raw row (raw_bcch.ingestion_runs)
+    observations.ingestion_run_id
 
 from observations
 

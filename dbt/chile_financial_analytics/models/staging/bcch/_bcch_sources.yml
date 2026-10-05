@@ -69,6 +69,18 @@ sources:
             tests:
               - not_null
 
+          - name: ingestion_run_id
+            description: >
+              The ingestion run that last wrote the row (inserted it or
+              changed its value). Rows loaded before the column existed
+              carry their original run id, rebuilt from extracted_at.
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('monitoring', 'ingestion_runs')
+                    field: run_id
+
         data_tests:
 
           # Grain: one row per series per date
@@ -184,3 +196,140 @@ sources:
           - name: source
             tests:
               - not_null
+
+          - name: ingestion_run_id
+            description: >
+              The ingestion run that last wrote the row (inserted it or
+              changed its value). Rows loaded before the column existed
+              carry their original run id, rebuilt from extracted_at.
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('monitoring', 'ingestion_runs')
+                    field: run_id
+
+  - name: monitoring
+    database: chile-financial-analytics
+    schema: monitoring
+    description: >
+      Pipeline observability, kept apart from source data and
+      independent of Airflow's metadata database.
+
+    tables:
+
+      - name: ingestion_runs
+        description: >
+          Audit log: one row per ingestion execution (src.ingestion.
+          observations or src.ingestion.series), written when it starts
+          and completed when it ends, failures included. Raw rows'
+          ingestion_run_id points here. Runs that predate the table have
+          status unknown and only id and start time.
+
+        columns:
+
+          - name: run_id
+            description: >
+              Unique per execution: start timestamp plus a random suffix
+              (older runs: timestamp only). Also the run summary's file
+              name and the run_id BigQuery job label.
+            tests:
+              - unique
+              - not_null
+
+          - name: source
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['bcch']
+
+          - name: started_at
+            tests:
+              - not_null
+
+          - name: completed_at
+
+          - name: status
+            description: >
+              running (in progress, or killed before finishing), success,
+              failed (some series failed validation or loading), crashed
+              (raised before writing its summary), unknown (predates the
+              table).
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['running', 'success', 'failed', 'crashed', 'unknown']
+
+          - name: extracted_rows
+            description: Rows fetched from BCCh.
+
+          - name: valid_rows
+            description: Rows that passed validation (validation accepts or rejects a whole series).
+
+          - name: rejected_rows
+            description: Rows that failed validation; kept as raw files, never loaded.
+
+          - name: loaded_rows
+            description: Rows written to the warehouse by a committed MERGE.
+
+          - name: error_message
+            description: >
+              Failed series and why, or the exception of a crashed run.
+              Redacted and capped at 1,000 characters; the run summary
+              (summary_uri) has the full detail.
+
+          - name: pipeline
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['bcch_ingestion', 'bcch_series_metadata']
+
+          - name: target_table
+            description: Raw table the run loads (dataset.table).
+            tests:
+              - not_null
+
+          - name: rows_changed
+            description: Rows the MERGE inserted, updated or deleted (0 when nothing new).
+
+          - name: summary_uri
+            description: The run summary JSON in GCS (per-series detail).
+
+          - name: parent_run_id
+            description: The src.pipelines.bcch run the step belonged to, if any.
+
+        data_tests:
+
+          # A finished run has an end, after its start
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: >
+                  (status in ('running', 'unknown') and completed_at is null)
+                  or (status not in ('running', 'unknown') and completed_at >= started_at)
+
+          # Rows only drop out between stages: extracted ≥ validated ≥ loaded
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: >
+                  valid_rows + rejected_rows <= extracted_rows
+                  and loaded_rows <= valid_rows
+              config:
+                where: "status in ('success', 'failed')"
+
+          # Failures say why; successes don't
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: >
+                  (status in ('failed', 'crashed')) = (error_message is not null)
+              config:
+                where: "status != 'unknown' and status != 'running'"
+
+          # Error payloads stay small
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: "length(error_message) <= 1000"
+              config:
+                where: "error_message is not null"

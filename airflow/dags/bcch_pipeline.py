@@ -69,6 +69,9 @@ task touching BigQuery at a time.
 
 ## Where to look
 
+- **Run history**: `monitoring.ingestion_runs` in BigQuery, one audit row
+  per ingestion run (failures included): status, row counts per stage,
+  error, Airflow run. Raw and mart rows carry `ingestion_run_id`.
 - **Task XComs**: ingestion run id, rows changed, duration, API retries and
   the run summary's `gs://` URI; dbt status counts and `invocation_id`;
   `report` has everything.

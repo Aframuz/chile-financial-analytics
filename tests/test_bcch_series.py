@@ -165,6 +165,7 @@ def test_prepare_series_merges_catalog_and_curated():
         catalog=pd.DataFrame([catalog_row()]),
         curated=CURATED,
         extracted_at=EXTRACTED_AT,
+        ingestion_run_id="run-1",
     )
 
     assert list(result.columns) == [
@@ -182,6 +183,7 @@ def test_prepare_series_merges_catalog_and_curated():
     assert str(row["first_observation_date"]) == "1982-08-09"
     assert str(row["extraction_date"]) == "2026-09-28"
     assert row["source"] == "bcch"
+    assert row["ingestion_run_id"] == "run-1"
 
 
 def test_prepare_series_rejects_duplicate_codes():
@@ -194,6 +196,7 @@ def test_prepare_series_rejects_duplicate_codes():
             ),
             curated=CURATED,
             extracted_at=EXTRACTED_AT,
+            ingestion_run_id="run-1",
         )
 
 
@@ -312,6 +315,9 @@ class FakeClient:
     def get_table(self, table_id):
         return self.table
 
+    def get_dataset(self, dataset_id):
+        return SimpleNamespace(location="southamerica-west1")
+
     def update_table(self, table, fields):
         self.updated.append(fields)
         return table
@@ -359,22 +365,48 @@ def test_add_missing_columns_is_noop_when_up_to_date():
     assert client.updated == []
 
 
-def test_ensure_observations_table_backfills_new_ingested_at(monkeypatch):
+def _without(*columns):
+
+    return [
+        field
+        for field in OBSERVATIONS_SCHEMA
+        if field.name not in columns
+    ]
+
+
+def test_migration_backfills_columns_and_registers_legacy_runs(monkeypatch):
 
     monkeypatch.setattr(bq, "job_labels", lambda: {})
 
-    old_schema = [
-        field
-        for field in OBSERVATIONS_SCHEMA
-        if field.name != "ingested_at"
-    ]
-    client = FakeClient(_observations_table(old_schema))
+    client = FakeClient(
+        _observations_table(_without("ingested_at", "ingestion_run_id"))
+    )
+
+    ensure_observations_table(client, "p", "raw_bcch")
+
+    backfill, register = client.queries
+
+    # One UPDATE for both new columns, only where still NULL
+    assert "ingested_at = COALESCE(ingested_at, extracted_at)" in backfill
+    assert "ingestion_run_id = COALESCE(ingestion_run_id, CONCAT(" in backfill
+    assert "WHERE ingested_at IS NULL OR ingestion_run_id IS NULL" in backfill
+
+    # Then every backfilled run id gets an ingestion_runs row
+    # ...in the monitoring dataset
+    assert "INSERT INTO `p.monitoring.ingestion_runs`" in register
+    assert "'unknown'" in register
+
+
+def test_migration_without_run_id_column_skips_legacy_runs(monkeypatch):
+
+    monkeypatch.setattr(bq, "job_labels", lambda: {})
+
+    client = FakeClient(_observations_table(_without("ingested_at")))
 
     ensure_observations_table(client, "p", "raw_bcch")
 
     assert len(client.queries) == 1
-    assert "SET ingested_at = extracted_at" in client.queries[0]
-    assert "WHERE ingested_at IS NULL" in client.queries[0]
+    assert "ingestion_run_id" not in client.queries[0]
 
 
 def test_ensure_observations_table_skips_backfill_when_column_exists():

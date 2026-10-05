@@ -170,6 +170,18 @@ models:
         tests:
           - not_null
 
+      - name: ingestion_run_id
+        description: >
+          Lineage: the ingestion run that last wrote the source raw row.
+          Details (status, row counts, Airflow run, run summary) in
+          raw_bcch.ingestion_runs.
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: source('monitoring', 'ingestion_runs')
+                field: run_id
+
     data_tests:
 
       - dbt_utils.unique_combination_of_columns:

@@ -53,6 +53,7 @@ def test_prepare_bcch_observations():
         series_config=config,
         extracted_at=extracted_at,
         ingested_at=ingested_at,
+        ingestion_run_id="20260926T153000000000Z-abcd1234",
     )
 
     assert len(result) == 2
@@ -67,6 +68,7 @@ def test_prepare_bcch_observations():
         "extraction_date",
         "extracted_at",
         "ingested_at",
+        "ingestion_run_id",
         "source",
     ]
 

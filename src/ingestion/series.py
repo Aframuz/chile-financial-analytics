@@ -49,7 +49,6 @@ from src.common.exit_codes import (
 
 from src.common.logging_config import (
     configure_logging,
-    run_context,
 )
 
 from src.common.redaction import (
@@ -71,8 +70,10 @@ from src.common.warehouse import (
 )
 
 from src.ingestion.bcch import (
-    make_run_id,
-    upload_run_summary,
+    IngestionRun,
+    RowCounts,
+    finish_run,
+    ingestion_run,
     RunResult,
     print_report,
     step_report,
@@ -94,6 +95,9 @@ CURATED_METADATA_PATH = Path("metadata/bcch/series.yml")
 SERIES_METADATA_DIR = "_series"
 
 RUNS_DIR = Path("data/_runs/bcch_series")
+
+# Pipeline name in run summaries and raw_bcch.ingestion_runs
+PIPELINE = "bcch_series_metadata"
 
 # __spec__.name keeps the module path when run with `python -m`
 logger = logging.getLogger(__spec__.name if __spec__ else __name__)
@@ -208,6 +212,7 @@ def save_metadata(
     source_records: pd.DataFrame,
     series_configs: list[dict[str, Any]],
     extracted_at: datetime,
+    ingestion_run_id: str,
     output_dir: Path,
     checksum: str,
     validations: dict[str, dict[str, Any]],
@@ -230,6 +235,9 @@ def save_metadata(
 
         "extracted_at_utc":
             extracted_at.isoformat(),
+
+        "ingestion_run_id":
+            ingestion_run_id,
 
         "extractor":
             "bcchapi",
@@ -267,18 +275,24 @@ def ingest_series_metadata(
     client: bcchapi.Siete,
     series_configs: list[dict[str, Any]],
     curated: dict[str, dict[str, Any]],
-    run_started_at: datetime,
+    run: IngestionRun,
     timings: Timings | None = None,
     retry_stats: RetryStats | None = None,
+    counts: RowCounts | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Ingest metadata for the configured series.
 
     Returns one result per series, and the warehouse rows changed.
     timings: filled with seconds per step for the whole batch.
+    counts: catalog rows extracted, validated and loaded so far, for
+    the whole batch; kept if a step raises.
     """
 
     if timings is None:
         timings = Timings()
+
+    if counts is None:
+        counts = RowCounts()
 
     with timings.measure("extract"):
         catalog = extract_catalog(
@@ -297,6 +311,8 @@ def ingest_series_metadata(
         .reset_index(drop=True)
     )
 
+    counts.extracted = len(source_records)
+
     with timings.measure("validate"):
         validations = {
             series_config["code"]: validate_series_metadata(
@@ -313,7 +329,7 @@ def ingest_series_metadata(
         }
 
     extraction_date = (
-        run_started_at
+        run.started_at
         .date()
         .isoformat()
     )
@@ -332,7 +348,8 @@ def ingest_series_metadata(
         metadata_path = save_metadata(
             source_records=source_records,
             series_configs=series_configs,
-            extracted_at=run_started_at,
+            extracted_at=run.started_at,
+            ingestion_run_id=run.run_id,
             output_dir=output_dir,
             checksum=checksum,
             validations=validations,
@@ -351,6 +368,10 @@ def ingest_series_metadata(
         for code, validation in validations.items()
         if validation["passed"]
     ]
+
+    # A series missing from the catalog fails validation with no row
+    counts.valid = int(source_records["seriesId"].isin(passed_codes).sum())
+    counts.rejected = counts.extracted - counts.valid
 
     for code, validation in validations.items():
 
@@ -371,7 +392,8 @@ def ingest_series_metadata(
             source_records["seriesId"].isin(passed_codes)
         ],
         curated=curated,
-        extracted_at=run_started_at,
+        extracted_at=run.started_at,
+        ingestion_run_id=run.run_id,
     )
 
     with timings.measure("warehouse"):
@@ -380,6 +402,9 @@ def ingest_series_metadata(
             configured_codes=codes,
             timings=timings,
         )
+
+    if bigquery_enabled():
+        counts.loaded = len(warehouse_df)
 
     logger.info(
         "Loaded series metadata: %s/%s series passed validation, "
@@ -407,6 +432,11 @@ def ingest_series_metadata(
             "checksum_sha256": checksum,
             "quality_passed":
                 validations[series_config["code"]]["passed"],
+            "failed_checks": [
+                check["name"]
+                for check in validations[series_config["code"]]["checks"]
+                if not check["passed"]
+            ],
             "warehouse_loaded": (
                 bigquery_enabled()
                 and series_config["code"] in passed_codes
@@ -435,20 +465,20 @@ def main() -> int:
 def run_series() -> RunResult:
     """Extract, validate and load series metadata (a catalog snapshot)."""
 
-    run_started_at = datetime.now(
-        timezone.utc
-    )
+    with ingestion_run(
+        pipeline=PIPELINE,
+        table_name="series",
+    ) as run:
+        return _run_series(run)
 
-    with run_context(make_run_id(run_started_at)):
-        return _run_series(run_started_at)
 
-
-def _run_series(run_started_at: datetime) -> RunResult:
+def _run_series(run: IngestionRun) -> RunResult:
 
     rows_changed = 0
 
     timings = Timings()
     retry_stats = RetryStats()
+    counts = RowCounts()
 
     config = load_config(CONFIG_PATH)
 
@@ -487,9 +517,10 @@ def _run_series(run_started_at: datetime) -> RunResult:
             client=client,
             series_configs=series_configs,
             curated=curated,
-            run_started_at=run_started_at,
+            run=run,
             timings=timings,
             retry_stats=retry_stats,
+            counts=counts,
         )
 
     except Exception as exc:
@@ -528,22 +559,24 @@ def _run_series(run_started_at: datetime) -> RunResult:
 
     summary_path = save_run_summary(
         results=results,
-        started_at=run_started_at,
+        run_id=run.run_id,
+        started_at=run.started_at,
         ended_at=ended_at,
-        pipeline="bcch_series_metadata",
+        pipeline=PIPELINE,
         runs_dir=RUNS_DIR,
         details={
             "timings_seconds": timings,
             "api_retries": retry_stats.as_dict(),
         },
         rows_changed=rows_changed,
+        # One batch: counts belong to the run, not to each series
+        row_counts=counts,
     )
 
-
-    return RunResult(
-        exit_code=exit_code_for(results),
+    return finish_run(
+        run=run,
         summary_path=summary_path,
-        summary_uri=upload_run_summary(summary_path),
+        exit_code=exit_code_for(results),
     )
 
 if __name__ == "__main__":

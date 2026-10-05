@@ -103,6 +103,11 @@ models:
         tests:
           - not_null
 
+      - name: ingestion_run_id
+        description: The ingestion run that last wrote the raw row.
+        tests:
+          - not_null
+
     data_tests:
 
       # Grain: one observation per series per date

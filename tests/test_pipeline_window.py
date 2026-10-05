@@ -10,6 +10,7 @@ from src.common.exit_codes import (
     combine_exit_codes,
 )
 from src.ingestion import observations
+from src.ingestion.bcch import IngestionRun
 from src.ingestion.observations import (
     ingest_series,
     iso_date,
@@ -55,12 +56,18 @@ def test_empty_window_is_no_data_when_allowed(tmp_path, monkeypatch):
         client=EmptyBCChClient(),
         series_config=SERIES_CONFIG,
         end_date="2026-10-01",
-        run_started_at=datetime.now(timezone.utc),
+        run=IngestionRun(
+            run_id="test-run",
+            started_at=datetime.now(timezone.utc),
+            pipeline=observations.PIPELINE,
+            table_name="observations",
+        ),
         window="2026-09-30_2026-10-01",
     )
 
     assert result["status"] == "success"
     assert result["row_count"] == 0
+    assert result["loaded_rows"] == 0
     assert not any(tmp_path.iterdir())
 
 

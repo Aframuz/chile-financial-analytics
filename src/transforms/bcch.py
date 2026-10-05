@@ -7,6 +7,7 @@ def prepare_bcch_observations(
     series_config: dict,
     extracted_at: datetime,
     ingested_at: datetime,
+    ingestion_run_id: str,
 ) -> pd.DataFrame:
     """Canonical raw_bcch.observations rows.
 
@@ -15,6 +16,7 @@ def prepare_bcch_observations(
     extracted_at: when the run fetched the data from BCCh.
     ingested_at: when the rows are loaded into the warehouse; drives
     dbt source freshness.
+    ingestion_run_id: the run loading them (raw_bcch.ingestion_runs).
     """
 
     series_name = series_config["name"]
@@ -62,6 +64,10 @@ def prepare_bcch_observations(
         ingested_at
     )
 
+    result["ingestion_run_id"] = (
+        ingestion_run_id
+    )
+
     result["source"] = "bcch"
 
     return result[
@@ -75,6 +81,7 @@ def prepare_bcch_observations(
             "extraction_date",
             "extracted_at",
             "ingested_at",
+            "ingestion_run_id",
             "source",
         ]
     ]
@@ -97,6 +104,7 @@ def prepare_bcch_series(
     catalog: pd.DataFrame,
     curated: dict[str, dict],
     extracted_at: datetime,
+    ingestion_run_id: str,
 ) -> pd.DataFrame:
     """Canonical raw_bcch.series rows.
 
@@ -105,6 +113,7 @@ def prepare_bcch_series(
 
     catalog: BCCh SearchSeries rows, one per series.
     curated: metadata/bcch/series.yml entries keyed by code.
+    ingestion_run_id: the run loading them (raw_bcch.ingestion_runs).
     """
 
     duplicated = catalog["seriesId"].duplicated()
@@ -164,6 +173,8 @@ def prepare_bcch_series(
 
     result["source"] = "bcch"
 
+    result["ingestion_run_id"] = ingestion_run_id
+
     return result[
         [
             "series_code",
@@ -180,5 +191,6 @@ def prepare_bcch_series(
             "extraction_date",
             "extracted_at",
             "source",
+            "ingestion_run_id",
         ]
     ]

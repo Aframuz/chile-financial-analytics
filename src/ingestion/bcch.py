@@ -9,7 +9,10 @@ Used by both BCCh pipelines:
 import json
 import logging
 import os
+import uuid
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,14 +25,25 @@ from dotenv import load_dotenv
 
 from src.common.logging_config import (
     current_parent_run_id,
+    run_context,
 )
 
 from src.common.publisher import (
     publish_run_summary,
 )
 
+from src.common.redaction import (
+    safe_error_message,
+)
+
 from src.common.storage import (
     write_json_atomic,
+)
+
+from src.common.warehouse import (
+    record_run_completed,
+    record_run_crashed,
+    record_run_started,
 )
 
 
@@ -38,6 +52,9 @@ logger = logging.getLogger(__name__)
 # PATHS
 CONFIG_PATH = Path("config/bcch_series.yml")
 RAW_DATA_DIR = Path("data/raw/bcch")
+
+# Audit records keep a short error; the run summary has the detail
+MAX_ERROR_MESSAGE_LENGTH = 1000
 RUNS_DIR = Path("data/_runs/bcch")
 
 # ==================================
@@ -139,21 +156,95 @@ def resolve_end_date(
     return datetime.now(timezone.utc).date().isoformat()
 
 def make_run_id(started_at: datetime) -> str:
-    """Run id: the start timestamp, also the run summary's file name."""
+    """Unique id of one execution, also the run summary's file name.
 
-    return started_at.strftime("%Y%m%dT%H%M%S%fZ")
+    The start timestamp keeps ids sortable by time; the random suffix
+    makes them unique even for runs started in the same microsecond.
+    Runs before the suffix was added have the timestamp only.
+    """
+
+    return (
+        started_at.strftime("%Y%m%dT%H%M%S%fZ")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
+
+
+@dataclass
+class RowCounts:
+    """Rows through each stage of one series (or batch), kept as it goes.
+
+    Passed into a step like Timings, so a step that raises midway still
+    reports how far its rows got.
+    """
+
+    extracted: int = 0
+    valid: int = 0
+    rejected: int = 0
+    loaded: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        """Result fields summed by save_run_summary."""
+
+        return {
+            "row_count": self.extracted,
+            "valid_rows": self.valid,
+            "rejected_rows": self.rejected,
+            "loaded_rows": self.loaded,
+        }
+
+
+def short_error_message(message: str | None) -> str | None:
+    """Truncate an error for audit records (already redacted)."""
+
+    if not message or len(message) <= MAX_ERROR_MESSAGE_LENGTH:
+        return message
+
+    suffix = " … (truncated; see run summary)"
+
+    return message[: MAX_ERROR_MESSAGE_LENGTH - len(suffix)] + suffix
+
+
+def run_error_message(results: list[dict[str, Any]]) -> str | None:
+    """One line naming each failed series and why, or None if none failed."""
+
+    errors = []
+
+    for result in results:
+
+        if result["status"] == "success":
+            continue
+
+        reason = (
+            result.get("error")
+            or ", ".join(result.get("failed_checks") or [])
+            or "no detail"
+        )
+
+        errors.append(
+            f"{result.get('series_name')}: {result['status']} ({reason})"
+        )
+
+    return short_error_message("; ".join(errors)) if errors else None
 
 
 def save_run_summary(
     results: list[dict[str, Any]],
+    run_id: str,
     started_at: datetime,
     ended_at: datetime,
     pipeline: str,
     runs_dir: Path,
     details: dict[str, Any] | None = None,
     rows_changed: int | None = None,
+    row_counts: RowCounts | None = None,
 ) -> Path:
     """Write a JSON summary of a pipeline run, one result per series.
+
+    Row counts, summed over results (see RowCounts.as_dict):
+    extracted_rows fetched from BCCh, valid_rows / rejected_rows that
+    passed / failed validation, loaded_rows written to the warehouse.
+    row_counts: batch counts instead, when results don't carry them.
 
     rows_changed: warehouse rows the run changed; defaults to the sum
     of the per-series values.
@@ -164,8 +255,6 @@ def save_run_summary(
             result.get("rows_changed") or 0
             for result in results
         )
-
-    run_id = make_run_id(started_at)
 
     success_count = sum(
         result["status"] == "success"
@@ -213,8 +302,28 @@ def save_run_summary(
 
         **(details or {}),
 
+        **{
+            name: (
+                row_counts.as_dict()[result_field]
+                if row_counts is not None
+                else sum(
+                    result.get(result_field) or 0
+                    for result in results
+                )
+            )
+            for name, result_field in (
+                ("extracted_rows", "row_count"),
+                ("valid_rows", "valid_rows"),
+                ("rejected_rows", "rejected_rows"),
+                ("loaded_rows", "loaded_rows"),
+            )
+        },
+
         "rows_changed":
             rows_changed,
+
+        "error_message":
+            run_error_message(results),
 
         "total_series":
             len(results),
@@ -270,6 +379,84 @@ class RunResult:
     exit_code: int
     summary_path: Path
     summary_uri: str | None = None
+
+
+@dataclass(frozen=True)
+class IngestionRun:
+    """Identity of one execution, shared by everything it writes."""
+
+    run_id: str
+    started_at: datetime
+    pipeline: str
+    table_name: str
+
+
+@contextmanager
+def ingestion_run(pipeline: str, table_name: str) -> Iterator[IngestionRun]:
+    """Start an execution: new run id, log context, ingestion_runs row.
+
+    The row is written as running before any data; finish_run completes
+    it. A run that raises is marked crashed; one killed outright stays
+    running.
+
+    table_name: the raw table the run loads (e.g. "observations").
+    """
+
+    started_at = datetime.now(timezone.utc)
+
+    run = IngestionRun(
+        run_id=make_run_id(started_at),
+        started_at=started_at,
+        pipeline=pipeline,
+        table_name=table_name,
+    )
+
+    with run_context(run.run_id):
+
+        record_run_started(
+            run_id=run.run_id,
+            pipeline=pipeline,
+            table_name=table_name,
+            started_at=started_at,
+        )
+
+        try:
+            yield run
+
+        except Exception as exc:
+            record_run_crashed(
+                run_id=run.run_id,
+                pipeline=pipeline,
+                table_name=table_name,
+                started_at=started_at,
+                error_message=short_error_message(
+                    f"{type(exc).__name__}: {safe_error_message(exc)}"
+                ),
+            )
+            raise
+
+
+def finish_run(
+    run: IngestionRun,
+    summary_path: Path,
+    exit_code: int,
+) -> RunResult:
+    """Publish the run summary and complete the run's ingestion_runs row."""
+
+    summary_uri = upload_run_summary(summary_path)
+
+    record_run_completed(
+        summary=json.loads(summary_path.read_text(encoding="utf-8")),
+        table_name=run.table_name,
+        exit_code=exit_code,
+        summary_uri=summary_uri,
+    )
+
+    return RunResult(
+        exit_code=exit_code,
+        summary_path=summary_path,
+        summary_uri=summary_uri,
+    )
 
 
 def upload_run_summary(summary_path: Path) -> str | None:

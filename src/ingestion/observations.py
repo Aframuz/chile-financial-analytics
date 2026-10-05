@@ -36,7 +36,6 @@ from src.common.exit_codes import (
 
 from src.common.logging_config import (
     configure_logging,
-    run_context,
 )
 
 from src.common.redaction import (
@@ -65,9 +64,11 @@ from src.ingestion.bcch import (
     create_client,
     enabled_series,
     RunResult,
+    IngestionRun,
+    RowCounts,
+    finish_run,
+    ingestion_run,
     load_config,
-    make_run_id,
-    upload_run_summary,
     print_report,
     step_report,
     resolve_end_date,
@@ -78,6 +79,9 @@ from src.ingestion.bcch import (
 
 # __spec__.name keeps the module path when run with `python -m`
 logger = logging.getLogger(__spec__.name if __spec__ else __name__)
+
+# Pipeline name in run summaries and raw_bcch.ingestion_runs
+PIPELINE = "bcch_ingestion"
 
 # ==================================
 # FUNCTIONS
@@ -163,6 +167,7 @@ def save_metadata(
     start_date: str,
     end_date: str,
     extracted_at: datetime,
+    ingestion_run_id: str,
     output_dir: Path,
     checksum: str,
     validation: dict[str, Any],
@@ -212,6 +217,9 @@ def save_metadata(
         "extracted_at_utc":
             extracted_at.isoformat(),
 
+        "ingestion_run_id":
+            ingestion_run_id,
+
         "extractor":
             "bcchapi",
 
@@ -240,12 +248,16 @@ def ingest_series(
     client: bcchapi.Siete,
     series_config: dict[str, Any],
     end_date: str,
-    run_started_at: datetime,
+    run: IngestionRun,
     window: str | None = None,
     timings: Timings | None = None,
     retry_stats: RetryStats | None = None,
+    counts: RowCounts | None = None,
 ) -> dict[str, Any]:
     """Ingest a single series based on the provided configuration.
+
+    run: the execution this belongs to; its id is written on every
+    warehouse row (ingestion_run_id).
 
     window: set for an explicitly requested date window ("START_END").
     Raw files then land in a window= subfolder, and an empty extraction
@@ -255,6 +267,7 @@ def ingest_series(
     timings: filled with seconds per step (extract, validate, write_raw,
     publish, warehouse); pass one in to keep them if a step raises.
     retry_stats: BCCh API retries and waits, likewise.
+    counts: rows extracted, validated and loaded so far, likewise.
     """
 
     if timings is None:
@@ -262,6 +275,9 @@ def ingest_series(
 
     if retry_stats is None:
         retry_stats = RetryStats()
+
+    if counts is None:
+        counts = RowCounts()
 
     series_name = (
         series_config["name"]
@@ -285,6 +301,8 @@ def ingest_series(
             retry_stats=retry_stats,
         )
 
+    counts.extracted = len(df)
+
     if df.empty and window is not None:
 
         logger.info(
@@ -299,7 +317,7 @@ def ingest_series(
             "series_name": series_name,
             "series_code": series_code,
             "status": "success",
-            "row_count": 0,
+            **counts.as_dict(),
             "rows_changed": 0,
             "timings_seconds": timings,
             "api_retries": retry_stats.as_dict(),
@@ -313,8 +331,14 @@ def ingest_series(
             end_date=end_date,
         )
 
+    # Validation is per series: it accepts or rejects all its rows
+    if validation["passed"]:
+        counts.valid = len(df)
+    else:
+        counts.rejected = len(df)
+
     extraction_date = (
-        run_started_at
+        run.started_at
         .date()
         .isoformat()
     )
@@ -337,7 +361,8 @@ def ingest_series(
             series_config=series_config,
             start_date=start_date,
             end_date=end_date,
-            extracted_at=run_started_at,
+            extracted_at=run.started_at,
+            ingestion_run_id=run.run_id,
             output_dir=output_dir,
             checksum=checksum,
             validation=validation,
@@ -366,9 +391,14 @@ def ingest_series(
             rows_changed = publish_to_bigquery(
                 df=df,
                 series_config=series_config,
-                extracted_at=run_started_at,
+                extracted_at=run.started_at,
+                ingestion_run_id=run.run_id,
                 timings=timings,
             )
+
+        # The MERGE committed every validated row (one per date)
+        if bigquery_enabled():
+            counts.loaded = len(df)
 
         logger.info(
             "Loaded %s: %s rows extracted, %s changed in warehouse, "
@@ -397,7 +427,12 @@ def ingest_series(
         "series_name": series_name,
         "series_code": series_code,
         "status": status,
-        "row_count": len(df),
+        **counts.as_dict(),
+        "failed_checks": [
+            check["name"]
+            for check in validation["checks"]
+            if not check["passed"]
+        ],
         "local_data_path": str(data_path),
         "local_metadata_path": str(metadata_path),
         "data_uri": published["data_uri"],
@@ -473,22 +508,21 @@ def run_observations(
     Returns the exit code (see src/common/exit_codes.py) and summary path.
     """
 
-    run_started_at = datetime.now(
-        timezone.utc
-    )
-
-    with run_context(make_run_id(run_started_at)):
+    with ingestion_run(
+        pipeline=PIPELINE,
+        table_name="observations",
+    ) as run:
         return _run_observations(
             start_date=start_date,
             end_date=end_date,
-            run_started_at=run_started_at,
+            run=run,
         )
 
 
 def _run_observations(
     start_date: str | None,
     end_date: str | None,
-    run_started_at: datetime,
+    run: IngestionRun,
 ) -> RunResult:
 
     if start_date is not None:
@@ -546,6 +580,7 @@ def _run_observations(
 
         timings = Timings()
         retry_stats = RetryStats()
+        counts = RowCounts()
 
         try:
 
@@ -559,7 +594,7 @@ def _run_observations(
                 client=client,
                 series_config=series_config,
                 end_date=end_date,
-                run_started_at=run_started_at,
+                run=run,
                 window=(
                     f"{start_date}_{end_date}"
                     if start_date is not None
@@ -567,6 +602,7 @@ def _run_observations(
                 ),
                 timings=timings,
                 retry_stats=retry_stats,
+                counts=counts,
             )
 
             results.append(result)
@@ -590,6 +626,9 @@ def _run_observations(
 
                     "status":
                         "technical_failed",
+
+                    # How far its rows got before the failure
+                    **counts.as_dict(),
 
                     "error":
                         safe_error_message(exc),
@@ -648,9 +687,10 @@ def _run_observations(
 
     summary_path = save_run_summary(
         results=results,
-        started_at=run_started_at,
+        run_id=run.run_id,
+        started_at=run.started_at,
         ended_at=ended_at,
-        pipeline="bcch_ingestion",
+        pipeline=PIPELINE,
         runs_dir=RUNS_DIR,
         details={
             "requested_start_date": start_date,
@@ -665,11 +705,10 @@ def _run_observations(
         ),
     )
 
-
-    return RunResult(
-        exit_code=exit_code_for(results),
+    return finish_run(
+        run=run,
         summary_path=summary_path,
-        summary_uri=upload_run_summary(summary_path),
+        exit_code=exit_code_for(results),
     )
 
 if __name__ == "__main__":
