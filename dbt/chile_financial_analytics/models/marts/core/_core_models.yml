@@ -24,8 +24,16 @@ models:
           - not_null
 
       - name: category
+        tests:
+          - not_null
+
       - name: frequency
+        tests:
+          - not_null
+
       - name: unit
+        tests:
+          - not_null
 
 
   - name: dim_date

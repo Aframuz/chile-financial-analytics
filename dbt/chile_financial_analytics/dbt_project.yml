@@ -31,3 +31,24 @@ models:
 
     marts:
       +materialized: table
+
+# Singular tests live in one folder per data quality category, so each
+# category can be run on its own: dbt test --select tag:domain
+data_tests:
+  chile_financial_analytics:
+
+    # Shape: types, grain, date conventions
+    structural:
+      +tags: ["structural"]
+
+    # Consistency across models: fact vs staging, dims vs facts, SCD2
+    integrity:
+      +tags: ["integrity"]
+
+    # Economic rules per series: ranges, steps, calendars
+    domain:
+      +tags: ["domain"]
+
+    # Pipeline health: freshness, completeness
+    operational:
+      +tags: ["operational"]

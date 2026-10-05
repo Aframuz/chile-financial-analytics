@@ -26,3 +26,12 @@ snapshots:
       - name: dbt_valid_from
         tests:
           - not_null
+
+    data_tests:
+
+      # Grain: one row per series per version
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - series_code
+              - dbt_valid_from
