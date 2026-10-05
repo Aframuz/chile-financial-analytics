@@ -154,14 +154,21 @@ def dbt_run_paths() -> dict[str, str]:
     }
 
 
-def dbt_summary(command: str, target_path: str) -> dict[str, Any]:
-    """Status counts and invocation id from dbt's run_results.json, for XCom.
+def dbt_summary(
+    command: str,
+    target_path: str,
+    artifact: str = "run_results.json",
+) -> dict[str, Any]:
+    """Status counts and invocation id from a dbt results artifact, for XCom.
+
+    artifact: run_results.json, or sources.json for `dbt source freshness`
+    (same metadata and per-node status).
 
     invocation_id also labels the BigQuery jobs dbt ran (see
     macros/bcch_query_comment.sql), linking this task to them.
     """
 
-    path = os.path.join(target_path, "run_results.json")
+    path = os.path.join(target_path, artifact)
 
     with open(path, encoding="utf-8") as file:
         run_results = json.load(file)
@@ -175,3 +182,28 @@ def dbt_summary(command: str, target_path: str) -> dict[str, Any]:
         ),
         "target_path": target_path,
     }
+
+
+def freshness_summary(target_path: str) -> dict[str, Any]:
+    """dbt_summary of `dbt source freshness`, plus hours since each source
+    last loaded data.
+
+    Statuses: pass, warn, error (stale past error_after) and
+    runtime error (the freshness query itself failed).
+    """
+
+    summary = dbt_summary("source freshness", target_path, "sources.json")
+
+    with open(os.path.join(target_path, "sources.json"), encoding="utf-8") as file:
+        results = json.load(file)["results"]
+
+    # Keyed by source.table, e.g. "bcch.observations"
+    summary["hours_since_loaded"] = {
+        result["unique_id"].split(".", 2)[2]: round(
+            result["max_loaded_at_time_ago_in_s"] / 3600, 1
+        )
+        for result in results
+        if result.get("max_loaded_at_time_ago_in_s") is not None
+    }
+
+    return summary

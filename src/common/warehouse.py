@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 from google.cloud import bigquery
@@ -83,6 +83,7 @@ def publish_to_bigquery(
             df=df,
             series_config=series_config,
             extracted_at=extracted_at,
+            ingested_at=datetime.now(timezone.utc),
         )
     )
 

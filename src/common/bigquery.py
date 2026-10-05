@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 LABEL_INVALID_CHARS = re.compile(r"[^a-z0-9_-]")
 
-# When a row was extracted, not what was extracted: excluded from change
-# detection so unchanged rows keep the timestamp of their last real change.
+# When a row was extracted or loaded, not what was extracted: excluded
+# from change detection so unchanged rows keep the timestamps of their
+# last real change.
 AUDIT_COLUMNS = {
     "extraction_date",
     "extracted_at",
+    "ingested_at",
 }
 
 # Safety net: staging tables outlive a killed process (no `finally`).
@@ -69,6 +71,14 @@ OBSERVATIONS_SCHEMA = [
         "extracted_at",
         "TIMESTAMP",
         mode="REQUIRED",
+    ),
+    # When the row was last written to the warehouse (dbt source
+    # freshness). NULLABLE because it was added to an existing table,
+    # and BigQuery only adds NULLABLE columns; dbt tests it not_null.
+    bigquery.SchemaField(
+        "ingested_at",
+        "TIMESTAMP",
+        mode="NULLABLE",
     ),
     bigquery.SchemaField(
         "source",
@@ -244,6 +254,47 @@ def ensure_table(
     )
 
     return client.create_table(table)
+
+
+def add_missing_columns(
+    client: bigquery.Client,
+    table: bigquery.Table,
+    schema: list[bigquery.SchemaField],
+) -> list[str]:
+    """Append schema columns the table doesn't have yet; return their names.
+
+    Lets a new column in a canonical schema reach tables created before
+    it. Only additions: BigQuery adds them as NULLABLE, at the end, and
+    existing rows read NULL until backfilled.
+    """
+
+    existing = {
+        field.name
+        for field in table.schema
+    }
+
+    missing = [
+        field
+        for field in schema
+        if field.name not in existing
+    ]
+
+    if not missing:
+        return []
+
+    table.schema = [*table.schema, *missing]
+
+    client.update_table(table, ["schema"])
+
+    added = [field.name for field in missing]
+
+    logger.info(
+        "Added columns %s to %s",
+        added,
+        table.full_table_id,
+    )
+
+    return added
 
 
 def build_merge_query(
@@ -489,17 +540,68 @@ def ensure_observations_table(
     dataset_id: str,
 ) -> bigquery.Table:
 
-    return ensure_table(
+    table_id = (
+        f"{project_id}."
+        f"{dataset_id}."
+        f"observations"
+    )
+
+    table = ensure_table(
         client=client,
-        table_id=(
-            f"{project_id}."
-            f"{dataset_id}."
-            f"observations"
-        ),
+        table_id=table_id,
         schema=OBSERVATIONS_SCHEMA,
         partition_field="observation_date",
         clustering_fields=["series_code"],
     )
+
+    added = add_missing_columns(
+        client,
+        table,
+        OBSERVATIONS_SCHEMA,
+    )
+
+    # One-off migration, in the run that adds the column
+    if "ingested_at" in added:
+        backfill_ingested_at(client, table_id)
+
+    return table
+
+
+def backfill_ingested_at(
+    client: bigquery.Client,
+    table_id: str,
+) -> int:
+    """Set ingested_at on rows loaded before the column existed.
+
+    Their best known load time is extracted_at: the run that wrote them
+    loaded within minutes of starting.
+    """
+
+    job = client.query(
+        f"""
+        UPDATE `{table_id}`
+        SET ingested_at = extracted_at
+        WHERE ingested_at IS NULL
+        """,
+        job_config=bigquery.QueryJobConfig(
+            labels=job_labels(),
+        ),
+    )
+
+    job.result()
+
+    rows_updated = job.num_dml_affected_rows or 0
+
+    if rows_updated:
+        logger.info(
+            "Backfilled ingested_at from extracted_at on %s rows of %s "
+            "(job %s)",
+            rows_updated,
+            table_id,
+            job.job_id,
+        )
+
+    return rows_updated
 
 
 def load_observations(

@@ -6,6 +6,31 @@ sources:
     database: chile-financial-analytics 
     schema: raw_bcch
 
+    config:
+      meta:
+
+        # Freshness by update cadence, referenced by the observations__*
+        # entries below. ingested_at only moves when a row is inserted or
+        # its value changes, so these measure new data landing, not
+        # pipeline runs. Thresholds are calendar hours; BCCh publishes
+        # on business days.
+        freshness_by_cadence:
+
+          # New value every business day, published the evening before
+          # (Friday's run lands Monday's). warn: a long weekend (Friday
+          # load, Monday holiday). error: a break longer than that;
+          # Fiestas Patrias (5+ days) still trips it.
+          daily: &daily_freshness
+            warn_after: {count: 72, period: hour}
+            error_after: {count: 120, period: hour}
+
+          # One release a month (IPC ~8th of M+1, IMACEC ~1st of M+2),
+          # plus revisions in between. warn: a release a few days late.
+          # error: a release missed.
+          monthly: &monthly_freshness
+            warn_after: {count: 35, period: day}
+            error_after: {count: 45, period: day}
+
     tables:
 
       - name: observations
@@ -14,14 +39,9 @@ sources:
           Loaded by src/pipelines/bcch.py with a MERGE that skips
           unchanged rows.
 
-        # dbt source freshness. extracted_at only moves when a row
-        # changes; a Friday run already loads Monday's daily values, so
-        # weekends and Fiestas Patrias leave several quiet days. Warn
-        # only while bcch_pipeline is triggered manually.
-        config:
-          loaded_at_field: extracted_at
-          freshness:
-            warn_after: {count: 5, period: day}
+        # No table-level freshness: the daily series land every business
+        # day, so max(ingested_at) would hide a monthly series that
+        # stopped loading. See the per-series entries below.
 
         columns:
 
@@ -37,6 +57,15 @@ sources:
             description: Null on weekends/holidays for daily series.
 
           - name: extracted_at
+            description: When the run that last changed the row fetched it from BCCh.
+            tests:
+              - not_null
+
+          - name: ingested_at
+            description: >
+              When the row was last written to the warehouse: inserted,
+              or its value changed. Rows loaded before the column existed
+              were backfilled from extracted_at.
             tests:
               - not_null
 
@@ -48,6 +77,46 @@ sources:
                 combination_of_columns:
                   - series_code
                   - observation_date
+
+      # Freshness monitors: raw_bcch.observations filtered to one series,
+      # each against its cadence. Models read `observations`, not these.
+      # A new series in config/bcch_series.yml needs an entry here.
+
+      - name: observations__usd_clp
+        identifier: observations
+        description: Freshness of USD/CLP (F073.TCO.PRE.Z.D), daily.
+        config:
+          loaded_at_field: ingested_at
+          freshness:
+            <<: *daily_freshness
+            filter: "series_code = 'F073.TCO.PRE.Z.D'"
+
+      - name: observations__tpm
+        identifier: observations
+        description: Freshness of TPM (F022.TPM.TIN.D001.NO.Z.D), daily.
+        config:
+          loaded_at_field: ingested_at
+          freshness:
+            <<: *daily_freshness
+            filter: "series_code = 'F022.TPM.TIN.D001.NO.Z.D'"
+
+      - name: observations__imacec
+        identifier: observations
+        description: Freshness of IMACEC (F032.IMC.IND.Z.Z.EP18.Z.Z.0.M), monthly.
+        config:
+          loaded_at_field: ingested_at
+          freshness:
+            <<: *monthly_freshness
+            filter: "series_code = 'F032.IMC.IND.Z.Z.EP18.Z.Z.0.M'"
+
+      - name: observations__ipc_monthly_variation
+        identifier: observations
+        description: Freshness of IPC Monthly Variation (G073.IPC.VAR.2023.M), monthly.
+        config:
+          loaded_at_field: ingested_at
+          freshness:
+            <<: *monthly_freshness
+            filter: "series_code = 'G073.IPC.VAR.2023.M'"
 
       - name: series
         description: >

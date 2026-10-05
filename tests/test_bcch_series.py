@@ -4,12 +4,17 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from google.cloud import bigquery
+
+from src.common import bigquery as bq
 from src.common.bigquery import (
     OBSERVATIONS_KEY,
     OBSERVATIONS_SCHEMA,
     SERIES_KEY,
     SERIES_SCHEMA,
+    add_missing_columns,
     build_merge_query,
+    ensure_observations_table,
 )
 from src.ingestion.series import (
     extract_catalog,
@@ -279,6 +284,107 @@ def test_merge_only_updates_changed_rows():
     assert "target.extraction_date IS DISTINCT FROM" not in query
     # ...but are refreshed when something else changed
     assert "extracted_at = source.extracted_at" in query
+
+
+def test_observations_merge_ignores_ingested_at_changes():
+
+    query = build_merge_query(
+        target_table="p.raw_bcch.observations",
+        staging_table="p.raw_bcch._staging_x",
+        schema=OBSERVATIONS_SCHEMA,
+        key_columns=OBSERVATIONS_KEY,
+    )
+
+    # A rerun with unchanged values must not count as a change...
+    assert "target.ingested_at IS DISTINCT FROM" not in query
+    # ...but a real change records when it was loaded
+    assert "ingested_at = source.ingested_at" in query
+
+
+class FakeClient:
+    """Records schema updates and queries instead of calling BigQuery."""
+
+    def __init__(self, table):
+        self.table = table
+        self.updated = []
+        self.queries = []
+
+    def get_table(self, table_id):
+        return self.table
+
+    def update_table(self, table, fields):
+        self.updated.append(fields)
+        return table
+
+    def query(self, query, job_config=None):
+        self.queries.append(query)
+        return SimpleNamespace(
+            result=lambda: None,
+            num_dml_affected_rows=3,
+            job_id="job",
+        )
+
+
+def _observations_table(schema):
+
+    return bigquery.Table(
+        "p.raw_bcch.observations",
+        schema=schema,
+    )
+
+
+def test_add_missing_columns_appends_new_fields():
+
+    old_schema = [
+        field
+        for field in OBSERVATIONS_SCHEMA
+        if field.name != "ingested_at"
+    ]
+    table = _observations_table(old_schema)
+    client = FakeClient(table)
+
+    added = add_missing_columns(client, table, OBSERVATIONS_SCHEMA)
+
+    assert added == ["ingested_at"]
+    assert [field.name for field in table.schema][-1] == "ingested_at"
+    assert client.updated == [["schema"]]
+
+
+def test_add_missing_columns_is_noop_when_up_to_date():
+
+    table = _observations_table(OBSERVATIONS_SCHEMA)
+    client = FakeClient(table)
+
+    assert add_missing_columns(client, table, OBSERVATIONS_SCHEMA) == []
+    assert client.updated == []
+
+
+def test_ensure_observations_table_backfills_new_ingested_at(monkeypatch):
+
+    monkeypatch.setattr(bq, "job_labels", lambda: {})
+
+    old_schema = [
+        field
+        for field in OBSERVATIONS_SCHEMA
+        if field.name != "ingested_at"
+    ]
+    client = FakeClient(_observations_table(old_schema))
+
+    ensure_observations_table(client, "p", "raw_bcch")
+
+    assert len(client.queries) == 1
+    assert "SET ingested_at = extracted_at" in client.queries[0]
+    assert "WHERE ingested_at IS NULL" in client.queries[0]
+
+
+def test_ensure_observations_table_skips_backfill_when_column_exists():
+
+    client = FakeClient(_observations_table(OBSERVATIONS_SCHEMA))
+
+    ensure_observations_table(client, "p", "raw_bcch")
+
+    assert client.queries == []
+    assert client.updated == []
 
 
 def test_merge_without_delete_keeps_unmatched_rows():

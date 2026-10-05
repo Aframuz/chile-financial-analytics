@@ -39,10 +39,20 @@ def test_prepare_bcch_observations():
         tzinfo=timezone.utc,
     )
 
+    ingested_at = datetime(
+        2026,
+        9,
+        26,
+        15,
+        32,
+        tzinfo=timezone.utc,
+    )
+
     result = prepare_bcch_observations(
         df=df,
         series_config=config,
         extracted_at=extracted_at,
+        ingested_at=ingested_at,
     )
 
     assert len(result) == 2
@@ -56,6 +66,7 @@ def test_prepare_bcch_observations():
         "unit",
         "extraction_date",
         "extracted_at",
+        "ingested_at",
         "source",
     ]
 
@@ -73,3 +84,7 @@ def test_prepare_bcch_observations():
         result.iloc[0]["source"]
         == "bcch"
     )
+
+    assert (
+        result["ingested_at"] == ingested_at
+    ).all()

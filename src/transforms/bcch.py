@@ -6,7 +6,16 @@ def prepare_bcch_observations(
     df: pd.DataFrame,
     series_config: dict,
     extracted_at: datetime,
+    ingested_at: datetime,
 ) -> pd.DataFrame:
+    """Canonical raw_bcch.observations rows.
+
+    Grain: one row = one value of one series on one date.
+
+    extracted_at: when the run fetched the data from BCCh.
+    ingested_at: when the rows are loaded into the warehouse; drives
+    dbt source freshness.
+    """
 
     series_name = series_config["name"]
 
@@ -49,6 +58,10 @@ def prepare_bcch_observations(
         extracted_at
     )
 
+    result["ingested_at"] = (
+        ingested_at
+    )
+
     result["source"] = "bcch"
 
     return result[
@@ -61,6 +74,7 @@ def prepare_bcch_observations(
             "unit",
             "extraction_date",
             "extracted_at",
+            "ingested_at",
             "source",
         ]
     ]
