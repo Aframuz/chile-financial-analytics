@@ -22,3 +22,8 @@ airflow/logs/
 
 # Terraform
 .terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log
+crash.*.log

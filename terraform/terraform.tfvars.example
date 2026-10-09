@@ -1,0 +1,11 @@
+project_id = "your-gcp-project-id"
+
+environment = "dev"
+
+region = "southamerica-west1"
+
+bigquery_location = "southamerica-west1"
+
+operator_email = "you@example.com"
+
+github_repository = "your-github-user/your-repo"

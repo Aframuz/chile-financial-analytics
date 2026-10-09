@@ -204,3 +204,29 @@ run that last wrote it; its record is in `monitoring.ingestion_runs`.
 - **Metrics**: Airflow's own plus `bcch.*` (rows changed, durations,
   retries, dbt node statuses) via StatsD, served in Prometheus format at
   http://localhost:9102/metrics.
+
+### Infrastructure
+
+GCP resources (raw bucket, BigQuery datasets, service accounts and their
+IAM, GitHub Actions Workload Identity Federation) are managed with
+Terraform in `terraform/`. State lives in a versioned GCS bucket, created
+once by hand because the backend must exist before `terraform init`:
+
+```bash
+gcloud storage buckets create gs://aframuz-chile-financial-analytics-tfstate \
+    --project=chile-financial-analytics --location=southamerica-west1 \
+    --uniform-bucket-level-access --public-access-prevention
+gcloud storage buckets update gs://aframuz-chile-financial-analytics-tfstate --versioning
+```
+
+Then:
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars   # fill in
+terraform init
+terraform plan
+```
+
+The raw bucket and `raw_bcch` have `prevent_destroy`: a plan that would
+delete them fails instead.
