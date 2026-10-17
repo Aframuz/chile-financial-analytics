@@ -30,3 +30,15 @@ variable "github_repository" {
   description = "GitHub repository (owner/name) allowed to authenticate through Workload Identity Federation."
   type        = string
 }
+
+variable "composer_enabled" {
+  description = "Whether the Cloud Composer environment exists. Set in composer.auto.tfvars; everything around it stays either way."
+  type        = bool
+  default     = false
+}
+
+variable "composer_image_version" {
+  description = "Composer image, composer-3-airflow-<AIRFLOW_VERSION>-build.N, with AIRFLOW_VERSION as pinned in airflow/Dockerfile."
+  type        = string
+  default     = ""
+}

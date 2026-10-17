@@ -5,6 +5,8 @@ resource "google_project_service" "required" {
     "iam.googleapis.com",
     "iamcredentials.googleapis.com", # service account impersonation
     "sts.googleapis.com",            # Workload Identity Federation token exchange
+    "composer.googleapis.com",       # on even without an environment: the deploy checks for one
+    "secretmanager.googleapis.com",  # BCCh token for Composer
   ])
 
   service = each.value
