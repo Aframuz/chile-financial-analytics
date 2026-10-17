@@ -49,6 +49,9 @@ deploy job is skipped.
 
 ```bash
 cd terraform
+# terraform.tfvars also needs the repository's numeric IDs
+# (github_repository_id, github_repository_owner_id):
+gh api repos/Aframuz/chile-financial-analytics --jq '.id, .owner.id'
 terraform init
 terraform plan     # review: 3 service accounts, WIF bindings, IAM
 terraform apply
@@ -92,7 +95,8 @@ jobs that need it show as *skipped*.
 | `COMPOSER_LOCATION` | `southamerica-west1` | Composer deploy |
 
 Terraform's inputs in CI come from these variables, plus
-`github.repository`. They must match your local `terraform.tfvars`, or
+`github.repository`, `github.repository_id` and
+`github.repository_owner_id`. They must match your local `terraform.tfvars`, or
 every plan shows the difference as changes. Variables left at their
 defaults (`region`, `environment`…) need nothing.
 
@@ -205,11 +209,22 @@ forever, which blocks the merge.
 2. `google-github-actions/auth` exchanges it with Google's Security Token
    Service, through the provider `github-oidc` in the pool `github-actions`.
    The provider accepts tokens issued by
-   `https://token.actions.githubusercontent.com` for this repository only
-   (`attribute_condition`).
+   `https://token.actions.githubusercontent.com` for this repository only.
+   `attribute_condition` matches its numeric repository and owner IDs,
+   not its name.
 3. The resulting federated identity impersonates a service account, which
    it may do only if that account grants `roles/iam.workloadIdentityUser`
    to the token's exact subject.
+
+   The repository uses GitHub's **immutable subject** format, which embeds
+   those IDs:
+
+   ```
+   repo:Aframuz@37312916/chile-financial-analytics@1400634169:environment:ci
+   ```
+
+   Check the format with
+   `gh api repos/<owner>/<repo>/actions/oidc/customization/sub`.
 4. The job gets short-lived (1 h) credentials as Application Default
    Credentials, which `gcloud`, `bq`, `terraform` and dbt (`method: oauth`)
    pick up.
@@ -226,6 +241,9 @@ All of it is in `terraform/ci.tf`. For reference, these are the equivalent
 PROJECT=chile-financial-analytics
 PROJECT_NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
 REPO=Aframuz/chile-financial-analytics
+REPO_ID=$(gh api repos/$REPO --jq .id)
+OWNER_ID=$(gh api repos/$REPO --jq .owner.id)
+SUBJECT="repo:Aframuz@$OWNER_ID/chile-financial-analytics@$REPO_ID"   # immutable subject
 POOL=projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions
 
 gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com
@@ -237,14 +255,14 @@ gcloud iam workload-identity-pools providers create-oidc github-oidc \
   --location=global --workload-identity-pool=github-actions \
   --issuer-uri="https://token.actions.githubusercontent.com" \
   --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
-  --attribute-condition="assertion.repository == '$REPO'"
+  --attribute-condition="assertion.repository_id == '$REPO_ID' && assertion.repository_owner_id == '$OWNER_ID'"
 
 gcloud iam service-accounts create gha-ci --display-name="GitHub Actions ci"
 
 # One binding per trusted subject
 gcloud iam service-accounts add-iam-policy-binding gha-ci@$PROJECT.iam.gserviceaccount.com \
   --role=roles/iam.workloadIdentityUser \
-  --member="principal://iam.googleapis.com/$POOL/subject/repo:$REPO:environment:ci"
+  --member="principal://iam.googleapis.com/$POOL/subject/$SUBJECT:environment:ci"
 ```
 
 In a workflow:
@@ -262,14 +280,18 @@ steps:
 ```
 
 If authentication fails with `Permission 'iam.serviceAccounts.getAccessToken'
-denied`, the token's subject doesn't match a binding. Common causes: a job
-that isn't in the expected environment, the wrong branch, or different
-letter case in the repository name. Subjects are case-sensitive.
+denied`, the token's subject doesn't match a binding. Common causes:
 
-Possible hardening: repository names can be reused after a rename or
-deletion. To guard against that, map `attribute.repository_id =
-assertion.repository_id` and condition on the numeric ID
-(`gh api repos/$REPO --jq .id`) instead of the name.
+- a job that isn't in the expected environment, or runs on the wrong
+  branch;
+- the subject format: immutable (`owner@id/repo@id`) or classic
+  (`owner/repo`). Terraform binds the immutable one;
+- `github_repository_id` or `github_repository_owner_id` wrong in
+  `terraform.tfvars`;
+- letter case. Subjects are case-sensitive.
+
+Compare the bindings (`gcloud iam service-accounts get-iam-policy
+gha-ci@<project>.iam.gserviceaccount.com`) with the subject format above.
 
 ## Identities
 

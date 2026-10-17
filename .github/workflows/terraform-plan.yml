@@ -31,6 +31,8 @@ env:
   TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
   TF_VAR_operator_email: ${{ vars.TF_OPERATOR_EMAIL }}
   TF_VAR_github_repository: ${{ github.repository }}
+  TF_VAR_github_repository_id: ${{ github.repository_id }}
+  TF_VAR_github_repository_owner_id: ${{ github.repository_owner_id }}
 
 jobs:
   plan:

@@ -31,6 +31,19 @@ variable "github_repository" {
   type        = string
 }
 
+# GitHub's immutable OIDC subjects carry numeric IDs, which survive renames
+# and can't be reclaimed by someone registering the name after a deletion:
+#   gh api repos/<owner>/<repo> --jq '.id, .owner.id'
+variable "github_repository_id" {
+  description = "Numeric ID of github_repository."
+  type        = string
+}
+
+variable "github_repository_owner_id" {
+  description = "Numeric ID of github_repository's owner."
+  type        = string
+}
+
 variable "composer_enabled" {
   description = "Whether the Cloud Composer environment exists. Set in composer.auto.tfvars; everything around it stays either way."
   type        = bool

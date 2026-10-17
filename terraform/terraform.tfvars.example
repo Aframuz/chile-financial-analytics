@@ -10,4 +10,8 @@ operator_email = "you@example.com"
 
 github_repository = "your-github-user/your-repo"
 
+# gh api repos/<owner>/<repo> --jq '.id, .owner.id'
+github_repository_id       = "123456789"
+github_repository_owner_id = "12345678"
+
 # Cloud Composer: composer.auto.tfvars (committed)

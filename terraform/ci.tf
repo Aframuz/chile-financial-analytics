@@ -26,18 +26,20 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   workload_identity_pool_provider_id = "github-oidc"
   display_name                       = "GitHub OIDC"
 
-  # google.subject = "repo:<owner>/<repo>:<context>", where context is
-  # pull_request, ref:refs/heads/<branch> or environment:<name>. Only
-  # claims present in every token can be mapped: no `environment` here,
-  # the subject already carries it.
+  # google.subject is GitHub's immutable subject,
+  #   repo:<owner>@<owner_id>/<repo>@<repo_id>:<context>
+  # where context is pull_request, ref:refs/heads/<branch> or
+  # environment:<name>. Only claims present in every token can be mapped:
+  # no `environment` here, the subject already carries it.
   attribute_mapping = {
     "google.subject"       = "assertion.sub"
     "attribute.repository" = "assertion.repository"
     "attribute.ref"        = "assertion.ref"
   }
 
-  # Without a condition, any GitHub repository could use this provider
-  attribute_condition = "assertion.repository == \"${var.github_repository}\""
+  # Without a condition, any GitHub repository could use this provider.
+  # IDs, not the name: a renamed or re-registered name doesn't match.
+  attribute_condition = "assertion.repository_id == \"${var.github_repository_id}\" && assertion.repository_owner_id == \"${var.github_repository_owner_id}\""
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
@@ -45,7 +47,11 @@ resource "google_iam_workload_identity_pool_provider" "github" {
 }
 
 locals {
-  github_subject_prefix = "principal://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/subject/repo:${var.github_repository}"
+  github_owner     = split("/", var.github_repository)[0]
+  github_repo_name = split("/", var.github_repository)[1]
+
+  # Immutable subject (the repository's OIDC setting use_immutable_subject)
+  github_subject_prefix = "principal://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/subject/repo:${local.github_owner}@${var.github_repository_owner_id}/${local.github_repo_name}@${var.github_repository_id}"
 
   # Service account => OIDC subjects allowed to impersonate it
   github_impersonation = {
