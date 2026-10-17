@@ -129,8 +129,6 @@ def test_run_summary_is_mirrored_under_runs_prefix(
     monkeypatch,
 ):
 
-    from pathlib import Path
-
     summary = Path("data/_runs/bcch/run_date=2026-10-03/r1.json")
 
     monkeypatch.setenv("STORAGE_BACKEND", "gcs")

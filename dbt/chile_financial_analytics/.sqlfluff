@@ -1,0 +1,25 @@
+# SQLFluff with the dbt templater: models are linted as dbt compiles them
+# (refs, macros, dbt_utils resolved). The templater warms dbt's relation
+# cache, so it needs a BigQuery connection: CI lints inside the
+# authenticated dbt-build job, with the `ci` target of profiles/.
+#
+#   sqlfluff lint models/marts/core/dim_series.sql
+#
+# CI lints only the .sql files a pull request changes, so the existing
+# code converges file by file instead of in one restyling commit.
+[sqlfluff]
+templater = dbt
+dialect = bigquery
+rules = core
+max_line_length = 100
+
+[sqlfluff:templater:dbt]
+project_dir = .
+profiles_dir = profiles
+target = ci
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower

@@ -1,0 +1,19 @@
+# Actions are pinned to commit SHAs (supply chain): Dependabot proposes the
+# bumps, grouped into one weekly PR. Python locks are regenerated with
+# scripts/lock-deps.sh instead, against Airflow's constraints.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/setup-terraform
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: terraform
+    directory: /terraform
+    schedule:
+      interval: weekly

@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+# Unit tests only. The Airflow DAG tests (airflow/tests) need the Airflow
+# runtime and run in their own CI job: pytest airflow/tests
+testpaths = ["tests"]
+# Repo root on sys.path for `src` and `scripts` imports, however pytest is invoked
+pythonpath = ["."]
+
+[tool.ruff]
+# The Airflow image's Python (ARG PYTHON_VERSION in airflow/Dockerfile)
+target-version = "py311"
+extend-exclude = ["airflow/logs", "dbt"]
+
+[tool.ruff.lint]
+# Correctness rules only: pyflakes, pycodestyle errors, bugbear. Ruff's
+# wider default set (isort, pyupgrade...) would mean restyling the codebase.
+select = ["E4", "E7", "E9", "F", "B"]

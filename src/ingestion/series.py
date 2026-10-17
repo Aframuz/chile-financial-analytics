@@ -168,7 +168,7 @@ def extract_catalog(
             f"extract_{frequency.lower()}"
         ):
             response = call_with_retries(
-                lambda: session.search(frequency),
+                lambda frequency=frequency: session.search(frequency),
                 description=f"BCCh catalog search for {frequency}",
                 stats=retry_stats,
             )
