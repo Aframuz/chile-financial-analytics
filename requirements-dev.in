@@ -1,0 +1,6 @@
+# Unit tests and lint (CI python-tests job). Compiled to
+# requirements-dev.txt by scripts/lock-deps.sh, against Airflow's
+# constraints: tests run on the same library versions as the Airflow image.
+-r airflow/requirements.txt
+pytest==9.1.1
+ruff==0.17.0

@@ -1,0 +1,7 @@
+# dbt CI jobs: dbt (same versions as the Airflow image's dbt venv) plus
+# SQLFluff with its dbt templater. Compiled to requirements-dbt-ci.txt by
+# scripts/lock-deps.sh; airflow/requirements-dbt.txt is then constrained
+# to these versions.
+-r airflow/requirements-dbt.in
+sqlfluff==4.4.0
+sqlfluff-templater-dbt==4.4.0

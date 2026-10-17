@@ -1,0 +1,5 @@
+# dbt, installed in its own venv in the Airflow image (its dependency pins
+# conflict with Airflow's) and in CI. Compiled to requirements-dbt.txt by
+# scripts/lock-deps.sh.
+dbt-core==1.12.5
+dbt-bigquery==1.12.1
