@@ -51,10 +51,12 @@ x-airflow-common:
     # GCP: reuse host Application Default Credentials (gcloud auth application-default login)
     GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/gcloud/application_default_credentials.json
     GOOGLE_CLOUD_PROJECT: ${GCP_PROJECT_ID:-}
-    # dbt
+    # dbt: the repository's profile (target `airflow`), the same one
+    # Composer uses; GCP_PROJECT_ID comes from .env
     DBT_BIN: /opt/airflow/dbt_venv/bin/dbt
     DBT_PROJECT_DIR: /opt/airflow/project/dbt/chile_financial_analytics
-    DBT_PROFILES_DIR: /opt/airflow/dbt_profiles
+    DBT_PROFILES_DIR: /opt/airflow/project/dbt/chile_financial_analytics/profiles
+    DBT_TARGET: airflow
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
@@ -67,7 +69,6 @@ x-airflow-common:
     - ./dbt:/opt/airflow/project/dbt
     # Only the ADC file, not the whole gcloud dir (other accounts, token caches).
     - ${HOME}/.config/gcloud/application_default_credentials.json:/opt/airflow/gcloud/application_default_credentials.json:ro
-    - ${HOME}/.dbt:/opt/airflow/dbt_profiles:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on

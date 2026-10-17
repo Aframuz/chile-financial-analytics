@@ -95,6 +95,7 @@ from airflow.sdk.observability.stats import Stats
 from bcch_common import (
     BIGQUERY_POOL,
     INGESTION_RETRYABLE_EXIT_CODES,
+    dbt_bin,
     dbt_run_paths,
     dbt_summary,
     freshness_summary,
@@ -126,7 +127,8 @@ def run_dbt(command: str) -> dict:
             command=command,
             target_path=shlex.quote(paths["target_path"]),
             log_path=shlex.quote(paths["log_path"]),
-        )
+        ),
+        env={"DBT_BIN": dbt_bin()},
     )
 
     if result.exit_code == 0:
@@ -149,7 +151,8 @@ def run_dbt_freshness() -> dict:
             command="source freshness",
             target_path=shlex.quote(paths["target_path"]),
             log_path=shlex.quote(paths["log_path"]),
-        )
+        ),
+        env={"DBT_BIN": dbt_bin()},
     )
 
     if result.exit_code in (0, 1) and os.path.exists(
