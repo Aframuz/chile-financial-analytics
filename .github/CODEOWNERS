@@ -1,0 +1,6 @@
+# Changes to how code is tested, deployed and authorised need an owner's
+# review once "Require review from Code Owners" is on (docs/ci-cd.md).
+/.github/            @Aframuz
+/terraform/          @Aframuz
+/scripts/ci/         @Aframuz
+/airflow/Dockerfile  @Aframuz

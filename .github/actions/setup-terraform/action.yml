@@ -1,0 +1,58 @@
+name: Set up Terraform
+description: >
+  Pinned Terraform CLI with a cached provider directory, optionally
+  authenticated to Google Cloud and initialised against the GCS backend.
+
+inputs:
+  terraform-version:
+    description: Terraform CLI version. The one pin for every workflow.
+    default: "1.16.5"
+  backend:
+    description: "'false' runs init -backend=false: no state, no credentials."
+    default: "true"
+  workload-identity-provider:
+    description: Full Workload Identity Provider name.
+    default: ""
+  service-account:
+    description: Service account to impersonate. Empty skips authentication.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        # Plain stdout/exit codes; workflows capture output themselves
+        terraform_wrapper: false
+
+    # Providers are verified against terraform/.terraform.lock.hcl, so the
+    # cache can only ever serve the locked versions
+    - name: Configure provider cache
+      shell: bash
+      run: |
+        echo "TF_PLUGIN_CACHE_DIR=$RUNNER_TEMP/terraform-plugins" >> "$GITHUB_ENV"
+        mkdir -p "$RUNNER_TEMP/terraform-plugins"
+
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/terraform-plugins
+        key: terraform-plugins-${{ runner.os }}-${{ hashFiles('terraform/.terraform.lock.hcl') }}
+
+    - if: inputs.service-account != ''
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+
+    - name: terraform init
+      shell: bash
+      working-directory: terraform
+      env:
+        BACKEND: ${{ inputs.backend }}
+      run: |
+        if [[ "$BACKEND" == "false" ]]; then
+          terraform init -input=false -backend=false
+        else
+          terraform init -input=false
+        fi

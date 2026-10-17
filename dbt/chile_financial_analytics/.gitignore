@@ -3,3 +3,6 @@ target/
 dbt_packages/
 logs/
 .env
+
+# dbt writes its anonymous usage id next to profiles.yml
+profiles/.user.yml

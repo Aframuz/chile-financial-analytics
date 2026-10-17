@@ -1,3 +1,8 @@
+# Chile Financial Analytics Platform
+
+[![CI](https://github.com/Aframuz/chile-financial-analytics/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aframuz/chile-financial-analytics/actions/workflows/ci.yml?query=branch%3Amain)
+[![Terraform apply](https://github.com/Aframuz/chile-financial-analytics/actions/workflows/terraform-apply.yml/badge.svg?branch=main)](https://github.com/Aframuz/chile-financial-analytics/actions/workflows/terraform-apply.yml?query=branch%3Amain)
+
 ## Architecture
 
 ### Raw ingestion
@@ -230,3 +235,25 @@ terraform plan
 
 The raw bucket and `raw_bcch` have `prevent_destroy`: a plan that would
 delete them fails instead.
+
+### CI/CD
+
+Every pull request runs unit tests, Airflow DAG import tests against the
+pinned Airflow version, `dbt parse`, and `terraform validate`. Each runs
+only when its files change, and `CI result` is the one required check.
+dbt models are built and tested in the PR's own `analytics_ci_<PR>`
+datasets, dropped when it closes. Terraform changes are planned on the PR,
+with a risk assessment, and applied after merge: low-risk changes
+automatically, anything else after approval. Merged DAGs and code are
+delivered to Cloud Composer, an on-demand demo environment that can be
+deleted without breaking CI; local Airflow runs the same code unchanged. GitHub authenticates to GCP with Workload
+Identity Federation: no keys.
+
+Setup (identities, variables, environments, branch protection) and design
+notes: [docs/ci-cd.md](docs/ci-cd.md).
+
+```bash
+pytest                   # unit tests
+ruff check .
+scripts/lock-deps.sh     # after changing dependencies (needs uv)
+```

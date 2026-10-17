@@ -4,12 +4,27 @@ Tasks run the project's CLI entrypoints as subprocesses; the exit code
 decides whether Airflow retries (transient) or fails immediately. The
 entrypoints' last stdout line is a JSON report, which tasks return so
 Airflow stores it as an XCom: small metadata only, never data.
+
+The same DAGs run on the local docker-compose Airflow and on Cloud
+Composer. What differs between the two comes from the environment, and
+runtime_env() and dbt_bin() resolve it (see docs/ci-cd.md):
+
+| | local | Composer |
+|---|---|---|
+| BCCh token | BCCH_API_TOKEN from .env | Airflow Variable `bcch_api_token` (Secret Manager) |
+| dbt | venv baked into the image (DBT_BIN) | venv built on the worker from DBT_REQUIREMENTS |
 """
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from collections import Counter
 from typing import Any
 
@@ -38,6 +53,11 @@ INGESTION_RETRYABLE_EXIT_CODES = {75}  # EX_TEMPFAIL, see src/common/exit_codes.
 # whose dbt step failed; the next quiet run must still rebuild the marts.
 MARTS_STALE_VARIABLE = "bcch_marts_stale"
 
+# Where the BCCh token comes from when BCCH_API_TOKEN isn't set. On
+# Composer, the Secret Manager backend serves it from the secret
+# airflow-variables-bcch_api_token.
+BCCH_TOKEN_VARIABLE = "bcch_api_token"
+
 
 def airflow_context_env() -> dict[str, str]:
     """Airflow's run context as AIRFLOW_CTX_* variables for a subprocess.
@@ -57,10 +77,81 @@ def airflow_context_env() -> dict[str, str]:
     }
 
 
-def run_command(command: str) -> SubprocessResult:
+def runtime_env() -> dict[str, str]:
+    """Settings the environment doesn't provide on every runtime.
+
+    Locally, BCCH_API_TOKEN comes from .env. Composer doesn't get it as an
+    environment variable (readable by anyone who can view the
+    environment), so it's fetched from the Airflow Variable instead.
+    """
+
+    env = {}
+
+    if not os.environ.get("BCCH_API_TOKEN"):
+        token = Variable.get(BCCH_TOKEN_VARIABLE, default=None)
+        if token:
+            env["BCCH_API_TOKEN"] = token
+
+    return env
+
+
+def dbt_bin() -> str:
+    """Path to the dbt executable, building a venv for it if needed.
+
+    Locally, the image has dbt in its own venv (DBT_BIN). Composer can't
+    get one baked in, and installing dbt into Airflow's environment would
+    fight Airflow's pins, so the first dbt task on a worker builds a venv
+    from DBT_REQUIREMENTS (airflow/requirements-dbt.txt, the lock the image
+    and CI use) in worker-local storage. Later tasks reuse it; a changed
+    lock gets a new venv.
+    """
+
+    configured = os.environ.get("DBT_BIN", "")
+    if configured and shutil.which(configured):
+        return configured
+
+    requirements = os.environ.get("DBT_REQUIREMENTS")
+    if not requirements:
+        raise AirflowFailException(
+            f"dbt not found (DBT_BIN={configured!r}) and DBT_REQUIREMENTS is not set."
+        )
+
+    with open(requirements, "rb") as lock_file:
+        digest = hashlib.sha256(lock_file.read()).hexdigest()[:12]
+
+    root = os.environ.get("DBT_VENV_ROOT", tempfile.gettempdir())
+    venv = os.path.join(root, f"dbt_venv_{digest}")
+    binary = os.path.join(venv, "bin", "dbt")
+    # Written last: a venv without it is a build that was interrupted
+    complete = os.path.join(venv, ".complete")
+
+    # Two dbt tasks on one worker wait for a single build
+    with open(f"{venv}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+        if not os.path.exists(complete):
+            log.info("Building dbt venv %s from %s", venv, requirements)
+            shutil.rmtree(venv, ignore_errors=True)
+            try:
+                subprocess.run([sys.executable, "-m", "venv", venv], check=True)
+                subprocess.run(
+                    [os.path.join(venv, "bin", "pip"), "install",
+                     "--no-cache-dir", "-r", requirements],
+                    check=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                # e.g. PyPI unreachable: worth a retry
+                raise AirflowException(f"Building the dbt venv failed: {exc}") from exc
+            open(complete, "w").close()
+
+    return binary
+
+
+def run_command(command: str, env: dict[str, str] | None = None) -> SubprocessResult:
     """Run `command` in the project dir, streaming output to the task log.
 
-    Returns the exit code and the last output line.
+    `env` adds to (or overrides) the task's environment. Returns the exit
+    code and the last output line.
     """
 
     hook = SubprocessHook()
@@ -69,7 +160,7 @@ def run_command(command: str) -> SubprocessResult:
         result = hook.run_command(
             command=["bash", "-c", command],
             cwd=PROJECT_DIR,
-            env={**os.environ, **airflow_context_env()},
+            env={**os.environ, **runtime_env(), **airflow_context_env(), **(env or {})},
         )
     except BaseException:
         # e.g. execution_timeout: don't leave the child running.

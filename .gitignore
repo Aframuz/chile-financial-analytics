@@ -27,3 +27,8 @@ airflow/logs/
 terraform.tfvars
 crash.log
 crash.*.log
+# Terraform plans (CI)
+*.tfplan
+terraform/plan.json
+terraform/plan.txt
+terraform/risk.md

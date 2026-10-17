@@ -1,0 +1,74 @@
+name: dbt CI cleanup
+
+# Drops the per-PR datasets dbt-build (ci.yml) creates:
+#   - when the pull request closes (merged or not)
+#   - daily, a sweep of any analytics_ci_<PR> left behind by a PR that is
+#     no longer open (cleanup that failed, workflow that was cancelled)
+#
+# gha-ci owns these datasets because it created them, and can't delete
+# any other dataset.
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: read
+
+jobs:
+  cleanup:
+    name: Drop PR datasets
+    if: >-
+      vars.GCP_CI_SERVICE_ACCOUNT != ''
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: ci
+    env:
+      PROJECT: ${{ vars.GCP_PROJECT_ID }}
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Drop this pull request's datasets
+        if: github.event_name == 'pull_request'
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          for dataset in "analytics_ci_${PR}" "analytics_ci_${PR}_snapshots"; do
+            if bq show --format=none "${PROJECT}:${dataset}" 2>/dev/null; then
+              bq rm --recursive --force --dataset "${PROJECT}:${dataset}"
+              echo "Dropped ${dataset}"
+            fi
+          done
+
+      - name: Sweep datasets of closed pull requests
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          datasets=$(bq ls --project_id "$PROJECT" --max_results 10000 --format=json \
+            | jq -r '.[]?.datasetReference.datasetId' \
+            | grep -E '^analytics_ci_[0-9]+(_snapshots)?$' || true)
+
+          for dataset in $datasets; do
+            pr=$(sed -E 's/^analytics_ci_([0-9]+).*/\1/' <<< "$dataset")
+            state=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json state --jq .state 2>/dev/null || echo UNKNOWN)
+            # Only on a definite answer: an API hiccup must not drop an
+            # open PR's datasets
+            if [[ "$state" != "CLOSED" && "$state" != "MERGED" ]]; then
+              continue
+            fi
+            bq rm --recursive --force --dataset "${PROJECT}:${dataset}"
+            echo "Dropped ${dataset} (PR #${pr}: ${state})"
+          done

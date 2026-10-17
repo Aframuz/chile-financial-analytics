@@ -1,0 +1,178 @@
+name: Deploy to Cloud Composer
+
+# Continuous delivery of DAGs and the code they run. Called by ci.yml after
+# every check passed on main; also runnable by hand (Actions > Run workflow)
+# to redeploy main, e.g. right after recreating the environment.
+#
+# The environment exists only for demos (terraform/composer.tf): when it
+# doesn't, this succeeds without deploying, so deleting Composer never
+# breaks CI.
+#
+# Runs in the `composer` environment: main only, optionally with required
+# reviewers. Layout in the environment's bucket:
+#
+#   dags/            airflow/dags/*  (parsed by Airflow)
+#   data/project/    src/, config/, metadata/, dbt/, the dbt lock
+#                    (PROJECT_DIR for tasks: /home/airflow/gcs/data/project)
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  UV_VERSION: "0.11.6"
+
+jobs:
+  deploy:
+    name: Sync DAGs and code
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: composer
+    # One deploy at a time, and never cancel one halfway through a sync
+    concurrency:
+      group: deploy-composer
+      cancel-in-progress: false
+    env:
+      COMPOSER_ENVIRONMENT: ${{ vars.COMPOSER_ENVIRONMENT }}
+      COMPOSER_LOCATION: ${{ vars.COMPOSER_LOCATION }}
+    steps:
+      # The commit CI just tested (the `composer` environment only accepts
+      # main, so a manual run from another branch is refused)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_COMPOSER_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # Missing environment: nothing to deploy, not a failure. Any other
+      # error (permissions, API) still fails.
+      # CI tested the DAGs against the Airflow version in airflow/Dockerfile;
+      # refuse to ship them to an environment running another one.
+      - name: Find the environment
+        id: environment
+        run: |
+          if ! image=$(gcloud composer environments describe "$COMPOSER_ENVIRONMENT" \
+              --location "$COMPOSER_LOCATION" \
+              --format='value(config.softwareConfig.imageVersion)' 2> describe.err); then
+            if grep -qiE 'NOT_FOUND|not found' describe.err; then
+              echo "::notice::Composer environment ${COMPOSER_ENVIRONMENT} doesn't exist (composer_enabled = false): nothing to deploy."
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat describe.err >&2
+            exit 1
+          fi
+
+          pinned=$(sed -n 's/^ARG AIRFLOW_VERSION=//p' airflow/Dockerfile)
+          running=$(sed -E 's/.*-airflow-([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$image")
+          if [[ "$running" != "$pinned" ]]; then
+            echo "::error::Composer runs Airflow ${running} (${image}); airflow/Dockerfile pins ${pinned}."
+            exit 1
+          fi
+
+          dags_prefix=$(gcloud composer environments describe "$COMPOSER_ENVIRONMENT" \
+            --location "$COMPOSER_LOCATION" --format='value(config.dagGcsPrefix)')
+          {
+            echo "exists=true"
+            echo "python=$(sed -n 's/^ARG PYTHON_VERSION=//p' airflow/Dockerfile)"
+            echo "bucket=${dags_prefix%/dags}"   # gs://<bucket>
+          } >> "$GITHUB_OUTPUT"
+
+      # dbt packages aren't in git; Composer has no `dbt deps` step of its own
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.environment.outputs.exists == 'true'
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ steps.environment.outputs.python }}
+          activate-environment: true
+          cache-dependency-glob: requirements-dbt-ci.txt
+
+      - name: Fetch dbt packages
+        if: steps.environment.outputs.exists == 'true'
+        working-directory: dbt/chile_financial_analytics
+        env:
+          DBT_PROFILES_DIR: profiles
+          DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+        run: |
+          uv pip install -r ../../requirements-dbt-ci.txt
+          dbt deps
+
+      # Code first, DAGs last: a new DAG never runs against old code
+      - name: Sync project code
+        if: steps.environment.outputs.exists == 'true'
+        env:
+          BUCKET: ${{ steps.environment.outputs.bucket }}
+        run: |
+          sync() {
+            gcloud storage rsync "$1" "$2" --recursive \
+              --delete-unmatched-destination-objects \
+              --exclude='(^|.*/)__pycache__/.*|.*\.pyc$'"${3:+|$3}"
+          }
+          for dir in src config metadata; do
+            sync "$dir" "$BUCKET/data/project/$dir"
+          done
+          # target/ holds the tasks' run artefacts in the bucket: never
+          # synced, never deleted by a deploy
+          sync dbt/chile_financial_analytics \
+            "$BUCKET/data/project/dbt/chile_financial_analytics" \
+            '^(target|logs)/.*'
+          # The lock dbt's venv is built from on the workers
+          gcloud storage cp airflow/requirements-dbt.txt \
+            "$BUCKET/data/project/airflow/requirements-dbt.txt"
+
+      - name: Sync DAGs
+        if: steps.environment.outputs.exists == 'true'
+        env:
+          BUCKET: ${{ steps.environment.outputs.bucket }}
+        run: |
+          gcloud storage rsync airflow/dags "$BUCKET/dags" --recursive \
+            --delete-unmatched-destination-objects \
+            --exclude='(^|.*/)__pycache__/.*|.*\.pyc$|^airflow_monitoring\.py$'
+
+      # What airflow-init does locally. Idempotent, so a recreated
+      # environment gets it on its first deploy.
+      - name: Ensure the BigQuery pool
+        if: steps.environment.outputs.exists == 'true'
+        run: |
+          gcloud composer environments run "$COMPOSER_ENVIRONMENT" \
+            --location "$COMPOSER_LOCATION" \
+            pools set -- bcch_bigquery 1 "One BCCh BigQuery task at a time"
+
+      # The DAG processor re-parses changed files within about a minute.
+      # Import errors here mean a difference between CI's Airflow install
+      # and Composer's (preinstalled packages, environment variables).
+      - name: Check for DAG import errors
+        if: steps.environment.outputs.exists == 'true'
+        run: |
+          sleep 90
+          errors=$(gcloud composer environments run "$COMPOSER_ENVIRONMENT" \
+            --location "$COMPOSER_LOCATION" \
+            dags list-import-errors -- --output json 2>/dev/null \
+            | sed -n '/^\[/,$p')
+          echo "${errors:-[]}" | jq .
+          if [[ -n "$errors" ]] && jq -e 'length > 0' <<< "$errors" > /dev/null; then
+            echo "::error::Composer reports DAG import errors after the deploy."
+            exit 1
+          fi
+
+      - name: Summary
+        env:
+          EXISTS: ${{ steps.environment.outputs.exists }}
+          BUCKET: ${{ steps.environment.outputs.bucket }}
+        run: |
+          if [[ "$EXISTS" != "true" ]]; then
+            echo "### Composer \`${COMPOSER_ENVIRONMENT}\` doesn't exist: nothing deployed" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Deployed to Composer \`${COMPOSER_ENVIRONMENT}\`"
+            echo "- commit \`${GITHUB_SHA::7}\`"
+            echo "- \`${BUCKET}/dags\`, \`${BUCKET}/data/project\`"
+          } >> "$GITHUB_STEP_SUMMARY"

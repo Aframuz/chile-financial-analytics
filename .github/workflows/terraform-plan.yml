@@ -1,0 +1,112 @@
+name: Terraform plan
+
+# Shows the proposed infrastructure changes, and their risk level, on the
+# pull request before it is merged. Read-only: runs as gha-ci (roles/viewer
+# + securityReviewer) and never locks or writes state.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - terraform/**
+      # Read by terraform/composer.tf (Airflow pin, PyPI packages)
+      - airflow/Dockerfile
+      - airflow/requirements.txt
+      - scripts/ci/tf_plan_risk.py
+      - .github/actions/setup-terraform/**
+      - .github/workflows/terraform-plan.yml
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: "true"
+  # Must match your local terraform.tfvars, or the plan shows the
+  # difference as changes
+  TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+  TF_VAR_operator_email: ${{ vars.TF_OPERATOR_EMAIL }}
+  TF_VAR_github_repository: ${{ github.repository }}
+  TF_VAR_github_repository_id: ${{ github.repository_id }}
+  TF_VAR_github_repository_owner_id: ${{ github.repository_owner_id }}
+
+jobs:
+  plan:
+    name: Terraform plan
+    # Forks get no OIDC token; skipped until GCP is configured
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && vars.GCP_CI_SERVICE_ACCOUNT != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-terraform
+        with:
+          workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+
+      - name: terraform plan
+        working-directory: terraform
+        run: |
+          terraform plan -lock=false -no-color -out=plan.tfplan
+          terraform show -no-color plan.tfplan > plan.txt
+          terraform show -json plan.tfplan > plan.json
+
+      - name: Assess risk
+        id: risk
+        run: python3 scripts/ci/tf_plan_risk.py terraform/plan.json | tee terraform/risk.md
+
+      - name: Comment on pull request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- terraform-plan -->';
+            const risk = fs.readFileSync('terraform/risk.md', 'utf8');
+            let plan = fs.readFileSync('terraform/plan.txt', 'utf8');
+
+            // Comments are capped at 65536 characters
+            const limit = 55000;
+            if (plan.length > limit) {
+              plan = plan.slice(0, limit) + '\n\n... truncated, full plan in the workflow logs';
+            }
+
+            const body = [
+              marker,
+              '### Terraform plan',
+              '',
+              risk,
+              '',
+              '<details><summary>Plan output</summary>',
+              '',
+              '```',
+              plan,
+              '```',
+              '</details>',
+              '',
+              `_Commit ${context.sha.slice(0, 7)}, [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})_`,
+            ].join('\n');
+
+            // One comment per PR, updated on every push
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(
+              (comment) => comment.user.type === 'Bot' && comment.body.includes(marker),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+      - name: Summary
+        run: cat terraform/risk.md >> "$GITHUB_STEP_SUMMARY"

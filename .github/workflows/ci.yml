@@ -1,0 +1,391 @@
+name: CI
+
+# No workflow-level path filters: "CI result" is the required status check,
+# and a workflow skipped by `paths` never reports it, leaving pull requests
+# blocked. The `changes` job decides which jobs run instead; a README-only
+# change runs `changes` and `CI result` alone, with nothing to install.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # Supersede outdated pull request runs; never cancel a run on main
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.11.6"
+
+jobs:
+
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      airflow: ${{ steps.filter.outputs.airflow }}
+      dbt: ${{ steps.filter.outputs.dbt }}
+      terraform: ${{ steps.filter.outputs.terraform }}
+      composer: ${{ steps.filter.outputs.composer }}
+      airflow-version: ${{ steps.pins.outputs.airflow }}
+      python-version: ${{ steps.pins.outputs.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # airflow/Dockerfile is the one place the runtime is pinned: every
+      # job runs that Python, and the DAG tests that Airflow
+      - name: Read runtime pins
+        id: pins
+        run: |
+          echo "airflow=$(sed -n 's/^ARG AIRFLOW_VERSION=//p' airflow/Dockerfile)" >> "$GITHUB_OUTPUT"
+          echo "python=$(sed -n 's/^ARG PYTHON_VERSION=//p' airflow/Dockerfile)" >> "$GITHUB_OUTPUT"
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          # A change to CI itself, or to the runtime pins (every job's Python
+          # version comes from the Dockerfile), re-runs every check
+          filters: |
+            ci: &ci
+              - .github/workflows/ci.yml
+              - .github/actions/**
+              - airflow/Dockerfile
+            python:
+              - *ci
+              - src/**
+              - tests/**
+              - scripts/**
+              - config/**
+              - metadata/**
+              - pyproject.toml
+              - requirements-dev.txt
+              - airflow/requirements.txt
+            airflow:
+              - *ci
+              - airflow/dags/**
+              - airflow/tests/**
+              - airflow/Dockerfile
+              - airflow/requirements.txt
+            dbt:
+              - *ci
+              - dbt/chile_financial_analytics/**
+              - requirements-dbt-ci.txt
+              - airflow/requirements-dbt.txt
+            terraform:
+              - *ci
+              - terraform/**
+              - airflow/Dockerfile
+              - airflow/requirements.txt
+            composer:
+              - .github/workflows/deploy.yml
+              - airflow/dags/**
+              - airflow/requirements-dbt.txt
+              - src/**
+              - config/**
+              - metadata/**
+              - dbt/chile_financial_analytics/**
+
+  # ==================================
+  # Python: unit tests and lint
+  # ==================================
+
+  python-tests:
+    name: Python tests
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ needs.changes.outputs.python-version }}
+          activate-environment: true
+          cache-dependency-glob: requirements-dev.txt
+
+      # Full lock, resolved against Airflow's constraints (scripts/lock-deps.sh)
+      - name: Install dependencies
+        run: uv pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check --output-format=github .
+
+      - name: Unit tests
+        run: pytest
+
+  # ==================================
+  # Airflow: two levels of DAG validation
+  # ==================================
+
+  # Level 1: syntax only, no dependencies, seconds
+  airflow-compile:
+    name: Airflow DAGs compile
+    needs: changes
+    if: needs.changes.outputs.airflow == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ needs.changes.outputs.python-version }}
+          activate-environment: true
+          enable-cache: false
+
+      - name: Compile DAGs
+        run: python -m compileall -q airflow/dags
+
+  # Level 2: import every DAG with the pinned Airflow runtime, the version
+  # in airflow/Dockerfile installed with its constraints
+  airflow-dags:
+    name: Airflow DAG import tests
+    needs: [changes, airflow-compile]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ needs.changes.outputs.python-version }}
+          activate-environment: true
+          cache-dependency-glob: |
+            airflow/Dockerfile
+            airflow/requirements.txt
+
+      - name: Install Airflow with constraints
+        env:
+          AIRFLOW_VERSION: ${{ needs.changes.outputs.airflow-version }}
+          PYTHON_VERSION: ${{ needs.changes.outputs.python-version }}
+        run: |
+          uv pip install \
+            "apache-airflow==${AIRFLOW_VERSION}" \
+            -r airflow/requirements.txt \
+            "$(grep -o '^pytest==[^ ]*' requirements-dev.txt)" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+
+      - name: DAG import tests
+        env:
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow
+          AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+        run: pytest airflow/tests
+
+  # ==================================
+  # dbt
+  # ==================================
+
+  # No credentials: the CI profile is placeholders from the environment
+  dbt-parse:
+    name: dbt parse
+    needs: changes
+    if: needs.changes.outputs.dbt == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dbt/chile_financial_analytics
+    env:
+      DBT_PROFILES_DIR: profiles
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ needs.changes.outputs.python-version }}
+          activate-environment: true
+          cache-dependency-glob: requirements-dbt-ci.txt
+
+      - name: Install dbt
+        run: uv pip install -r ../../requirements-dbt-ci.txt
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dbt/chile_financial_analytics/dbt_packages
+          key: dbt-packages-${{ hashFiles('dbt/chile_financial_analytics/package-lock.yml') }}
+
+      - run: dbt deps
+      - run: dbt parse
+
+  # Builds and tests the PR's models in its own datasets, so pull requests
+  # never touch each other's models or analytics_dev:
+  #   PR #12 -> analytics_ci_12, analytics_ci_12_snapshots
+  # Dropped when the PR closes (dbt-ci-cleanup.yml). Skipped until GCP is
+  # configured, and for forks (no OIDC token).
+  dbt-build:
+    name: dbt build (PR datasets)
+    needs: [changes, dbt-parse]
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.GCP_CI_SERVICE_ACCOUNT != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: dbt/chile_financial_analytics
+    env:
+      DBT_PROFILES_DIR: profiles
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DBT_GCP_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      DBT_BQ_LOCATION: ${{ vars.BQ_LOCATION }}
+      DBT_CI_DATASET: analytics_ci_${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR merge commit and its first parent (the base branch tip)
+          fetch-depth: 2
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ needs.changes.outputs.python-version }}
+          activate-environment: true
+          cache-dependency-glob: requirements-dbt-ci.txt
+
+      - name: Install dbt and SQLFluff
+        run: uv pip install -r ../../requirements-dbt-ci.txt
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dbt/chile_financial_analytics/dbt_packages
+          key: dbt-packages-${{ hashFiles('dbt/chile_financial_analytics/package-lock.yml') }}
+
+      - run: dbt deps
+
+      # The dbt templater compiles through dbt, which needs the connection
+      # above. Only files this PR changes: existing code converges file by
+      # file instead of in one restyling commit.
+      - name: SQLFluff (changed files)
+        run: |
+          mapfile -t changed < <(
+            git diff --name-only --relative --diff-filter=d HEAD^1 HEAD -- \
+              'models/*.sql' 'snapshots/*.sql' 'analyses/*.sql' 'tests/*.sql'
+          )
+          if (( ${#changed[@]} == 0 )); then
+            echo "No SQL changes to lint."
+            exit 0
+          fi
+          sqlfluff lint --format github-annotation-native "${changed[@]}"
+
+      # Operational tests (freshness, stuck runs, gaps) judge production
+      # data health, not this change; they run in Airflow
+      - name: dbt build
+        run: dbt build --full-refresh --exclude tag:operational
+
+      # Second pass over the now-populated tables: exercises the
+      # incremental merge and its post-hook, then checks that the result
+      # still equals a full refresh
+      - name: dbt incremental run
+        run: |
+          dbt run --select config.materialized:incremental
+          dbt test --select tag:integrity
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### dbt CI datasets"
+            echo "- \`${DBT_GCP_PROJECT}.${DBT_CI_DATASET}\`"
+            echo "- \`${DBT_GCP_PROJECT}.${DBT_CI_DATASET}_snapshots\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==================================
+  # Terraform: offline checks (plans are in terraform-plan.yml)
+  # ==================================
+
+  terraform-validate:
+    name: Terraform validate
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform (no backend, no credentials)
+        uses: ./.github/actions/setup-terraform
+        with:
+          backend: "false"
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff terraform
+
+      - name: terraform validate
+        working-directory: terraform
+        run: terraform validate -no-color
+
+  # ==================================
+  # Required status check
+  # ==================================
+
+  # The only check branch protection needs to require. Skipped jobs (no
+  # relevant changes) count as passing; failed or cancelled ones don't.
+  ci-result:
+    name: CI result
+    if: always()
+    needs:
+      - changes
+      - python-tests
+      - airflow-compile
+      - airflow-dags
+      - dbt-parse
+      - dbt-build
+      - terraform-validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$RESULTS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null; then
+            echo "::error::One or more CI jobs failed or were cancelled."
+            exit 1
+          fi
+
+  # ==================================
+  # Continuous delivery: Cloud Composer
+  # ==================================
+
+  # After every check passed on main. Goes through the `composer`
+  # environment (main only, optional reviewers): see deploy.yml.
+  # The environment exists only for demos: while it's deleted, deploy.yml
+  # finds nothing and succeeds without deploying.
+  deploy-composer:
+    name: Deploy to Composer
+    needs: [changes, ci-result]
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && needs.changes.outputs.composer == 'true'
+      && vars.COMPOSER_ENVIRONMENT != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml

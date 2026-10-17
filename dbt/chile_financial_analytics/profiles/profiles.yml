@@ -1,0 +1,40 @@
+# dbt profiles for every non-interactive runtime, all configured from the
+# environment (placeholders otherwise, so `dbt parse` needs no
+# credentials). Authentication is always Application Default Credentials
+# (method: oauth): Workload Identity Federation in GitHub Actions, the host's
+# ADC in local Airflow, the environment's service account on Composer.
+# No key files.
+#
+#   DBT_PROFILES_DIR=<this folder>  DBT_TARGET=ci | airflow
+#
+# Interactive dbt on your machine can keep using ~/.dbt/profiles.yml.
+chile_financial_analytics:
+  target: "{{ env_var('DBT_TARGET', 'ci') }}"
+  outputs:
+
+    # GitHub Actions. Each pull request builds into its own datasets
+    # (.github/workflows/ci.yml):
+    #   analytics_ci_<PR>             models
+    #   analytics_ci_<PR>_snapshots   snapshots (schema='snapshots')
+    ci:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('DBT_GCP_PROJECT', 'ci-placeholder-project') }}"
+      dataset: "{{ env_var('DBT_CI_DATASET', 'analytics_ci') }}"
+      location: "{{ env_var('DBT_BQ_LOCATION', 'southamerica-west1') }}"
+      threads: 4
+      priority: interactive
+      job_execution_timeout_seconds: 300
+      job_retries: 1
+
+    # Airflow, local (docker-compose.airflow.yml) and Cloud Composer alike
+    airflow:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT_ID', 'airflow-placeholder-project') }}"
+      dataset: "{{ env_var('DBT_DATASET', 'analytics_dev') }}"
+      location: "{{ env_var('DBT_BQ_LOCATION', 'southamerica-west1') }}"
+      threads: 4
+      priority: interactive
+      job_execution_timeout_seconds: 300
+      job_retries: 1
